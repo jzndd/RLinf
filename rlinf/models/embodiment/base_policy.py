@@ -24,6 +24,7 @@ class ForwardType(Enum):
     CROSSQ = "crossq"
     CROSSQ_Q = "crossq_q"
     NFT = "nft"
+    ACTION_SAMPLING = "action_sampling"
 
 
 class BasePolicy(ABC):

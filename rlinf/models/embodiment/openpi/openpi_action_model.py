@@ -314,6 +314,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.default_forward(**kwargs)
         elif forward_type == ForwardType.NFT:
             return self.forward_nft(**kwargs)
+        elif forward_type == ForwardType.ACTION_SAMPLING:
+            return self.predict_action_batch(**kwargs)
         elif forward_type == ForwardType.SAC:
             return self.sac_forward(**kwargs)
         elif forward_type == ForwardType.SAC_Q:
