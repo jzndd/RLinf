@@ -237,12 +237,19 @@ class OfflineOpenPIGRPOActor(EmbodiedFSDPActor):
                 f"{self.cfg.algorithm.offline_reward_fn}. Expected one of ['mse', 'l1']."
             )
 
+        rollout_epoch = int(self.cfg.algorithm.rollout_epoch)
+        assert rollout_epoch == 1, (
+            "OfflineOpenPIGRPOActor currently materializes exactly one rollout batch "
+            f"per step, but got algorithm.rollout_epoch={rollout_epoch}."
+        )
+
         self.rollout_batch = build_offline_rollout_batch(
             prev_logprobs=prev_logprobs,
             forward_inputs=result["forward_inputs"],
             rewards=rewards,
             action_chunk=action_chunk,
         )
+        self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
 
         group_scores = rewards.sum(dim=-1).view(-1, group_size)
         metrics = {
