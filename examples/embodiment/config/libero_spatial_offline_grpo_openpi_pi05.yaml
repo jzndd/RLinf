@@ -1,0 +1,146 @@
+defaults:
+  - env/libero_spatial@env.train
+  - env/libero_spatial@env.eval
+  - model/pi0_5@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_spatial_offline_grpo_openpi_pi05"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1000
+  max_steps: -1
+
+  only_eval: False
+  val_check_interval: -1
+  save_interval: 100
+
+  resume_dir: null
+  ckpt_path: null
+
+data:
+  train_data_paths: "/mnt/project_rlinf/jzn/workspace/openpi/data/libero_spatial_fullshot"
+  # Increase prompt batch size to raise the effective offline GRPO batch on 4 GPUs.
+  # Runtime global batch size = prompt_batch_size_per_gpu * algorithm.group_size * actor_world_size = 16 * 8 * 4 = 512.
+  prompt_batch_size_per_gpu: 16
+  action_chunk: ${actor.model.openpi.action_chunk}
+  shuffle: True
+  seed: 42
+  num_workers: 4
+  image_key: "image"
+  wrist_image_key: "wrist_image"
+  state_key: "state"
+  action_key: "actions"
+  task_index_key: "task_index"
+  frame_index_key: "frame_index"
+  max_cache_episodes: 4
+
+algorithm:
+  normalize_advantages: True
+  group_size: 8
+  rollout_epoch: 1
+  eval_rollout_epoch: 0
+
+  reward_type: chunk_level
+  offline_reward_fn: l1
+  logprob_type: chunk_level
+  entropy_type: token_level
+  update_epoch: 4
+  adv_type: grpo
+  loss_type: actor
+  loss_agg_func: "token-mean"
+  entropy_bonus: 0.0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  # Keep reward filtering disabled for offline GRPO.
+  # The online spatial config filters by summed prompt scores in [0.1, 0.9],
+  # but offline dense L1 rewards sum to values far above that range.
+  filter_rewards: False
+
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: False
+
+env:
+  group_name: "EnvGroup"
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  recompute_logprobs: False
+  unnorm_key: libero_10
+  enable_offload: False
+  pipeline_stage_num: 1
+
+  model:
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  # Constraint: prompt_batch_size_per_gpu * algorithm.group_size must be divisible by micro_batch_size.
+  # Here 16 * 8 = 128 and 128 % 32 == 0, so per-rank gradient accumulation is 4.
+  micro_batch_size: 32
+  global_batch_size: 64
+  seed: 42
+  enable_offload: False
+
+  model:
+    model_path: "/mnt/project_rlinf/jzn/workspace/openpi/checkpoints/sft/pi05_libero_130_oneshot/libero_130/30000"
+    # Align the offline spatial setup with the online spatial GRPO baseline and the 5-step reward horizon.
+    num_steps: 3
+    num_action_chunks: 5
+
+  optim:
+    lr: 5.0e-6
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 1.0
+    weight_decay: 0.01
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
