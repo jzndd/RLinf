@@ -58,6 +58,7 @@ algorithm:
   eval_rollout_epoch: 0
 
   reward_type: chunk_level
+  offline_reward_fn: mse
   logprob_type: chunk_level
   entropy_type: token_level
   update_epoch: 4

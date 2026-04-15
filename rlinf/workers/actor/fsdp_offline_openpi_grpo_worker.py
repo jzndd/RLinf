@@ -37,6 +37,14 @@ def repeat_obs_for_grpo(
     return repeated_obs
 
 
+def discretize_gripper_actions(gripper_actions: torch.Tensor) -> torch.Tensor:
+    return torch.where(
+        gripper_actions >= 0,
+        torch.ones_like(gripper_actions),
+        -torch.ones_like(gripper_actions),
+    )
+
+
 def compute_mse_rewards(
     sampled_actions: torch.Tensor,
     gt_actions: torch.Tensor,
@@ -48,6 +56,30 @@ def compute_mse_rewards(
     mse = torch.mean((sampled_actions - gt_actions) ** 2, dim=-1)
     rewards = -mse
     return rewards, mse
+
+
+def compute_l1_rewards(
+    sampled_actions: torch.Tensor,
+    gt_actions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert sampled_actions.shape == gt_actions.shape, (
+        f"sampled_actions shape {sampled_actions.shape} does not match "
+        f"gt_actions shape {gt_actions.shape}"
+    )
+    assert sampled_actions.shape[-1] >= 2, (
+        "compute_l1_rewards expects action_dim >= 2 so the last dimension "
+        "can be reserved for gripper reward."
+    )
+
+    action_l1 = torch.mean(
+        torch.abs(sampled_actions[..., :-1] - gt_actions[..., :-1]),
+        dim=-1,
+    )
+    sampled_gripper = discretize_gripper_actions(sampled_actions[..., -1])
+    gt_gripper = discretize_gripper_actions(gt_actions[..., -1])
+    gripper_match = (sampled_gripper == gt_gripper).to(sampled_actions.dtype)
+    rewards = 0.8 * torch.exp(-5.0 * action_l1) + 0.2 * gripper_match
+    return rewards, action_l1, gripper_match
 
 
 def build_offline_rollout_batch(
@@ -187,7 +219,23 @@ class OfflineOpenPIGRPOActor(EmbodiedFSDPActor):
 
         sampled_actions = sampled_actions.to(torch.float32)
         prev_logprobs = result["prev_logprobs"].to(torch.float32)
-        rewards, mse = compute_mse_rewards(sampled_actions, repeated_gt_actions)
+
+        reward_mode = str(self.cfg.algorithm.offline_reward_fn).lower()
+        if reward_mode == "mse":
+            rewards, mse = compute_mse_rewards(sampled_actions, repeated_gt_actions)
+            l1 = torch.zeros_like(rewards)
+            gripper_match = torch.zeros_like(rewards)
+        elif reward_mode == "l1":
+            rewards, l1, gripper_match = compute_l1_rewards(
+                sampled_actions,
+                repeated_gt_actions,
+            )
+            mse = torch.zeros_like(rewards)
+        else:
+            raise ValueError(
+                "Unsupported offline_reward_fn: "
+                f"{self.cfg.algorithm.offline_reward_fn}. Expected one of ['mse', 'l1']."
+            )
 
         self.rollout_batch = build_offline_rollout_batch(
             prev_logprobs=prev_logprobs,
@@ -204,6 +252,10 @@ class OfflineOpenPIGRPOActor(EmbodiedFSDPActor):
             "reward_min": rewards.min().item(),
             "reward_max": rewards.max().item(),
             "mse_mean": mse.mean().item(),
+            "l1_mean": l1.mean().item(),
+            "gripper_match_rate": gripper_match.mean().item(),
+            "reward_mode_is_mse": 1.0 if reward_mode == "mse" else 0.0,
+            "reward_mode_is_l1": 1.0 if reward_mode == "l1" else 0.0,
             "group_score_std": group_scores.std(dim=-1).mean().item(),
         }
         return all_reduce_dict(metrics, op=torch.distributed.ReduceOp.AVG)
