@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
+from torch.nn.modules.module import _IncompatibleKeys
 
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
@@ -24,6 +25,49 @@ class FastWAMPolicy(nn.Module, BasePolicy):
         self.video_size = [int(v) for v in cfg.video_size]
         self.concat_multi_camera = str(cfg.get("concat_multi_camera", "horizontal"))
         self.binarize_gripper = bool(cfg.get("binarize_gripper", True))
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        del assign
+
+        if not isinstance(state_dict, dict):
+            raise TypeError(f"state_dict must be dict-like, got {type(state_dict)}")
+
+        if "mot" in state_dict:
+            mot_result = self.model.mot.load_state_dict(state_dict["mot"], strict=strict)
+            missing_keys = list(mot_result.missing_keys)
+            unexpected_keys = list(mot_result.unexpected_keys)
+
+            proprio_module = getattr(self.model, "proprio_encoder", None)
+            proprio_payload = state_dict.get("proprio_encoder")
+            if proprio_module is not None:
+                if proprio_payload is None:
+                    if strict:
+                        raise RuntimeError(
+                            "FastWAM checkpoint is missing `proprio_encoder` while current model requires it."
+                        )
+                    missing_keys.extend([
+                        "proprio_encoder.weight",
+                        "proprio_encoder.bias",
+                    ])
+                else:
+                    proprio_result = proprio_module.load_state_dict(
+                        proprio_payload,
+                        strict=strict,
+                    )
+                    missing_keys.extend([
+                        f"proprio_encoder.{key}" for key in proprio_result.missing_keys
+                    ])
+                    unexpected_keys.extend([
+                        f"proprio_encoder.{key}" for key in proprio_result.unexpected_keys
+                    ])
+            elif proprio_payload is not None and strict:
+                raise RuntimeError(
+                    "FastWAM checkpoint contains `proprio_encoder` but current model does not use it."
+                )
+
+            return _IncompatibleKeys(missing_keys, unexpected_keys)
+
+        return super().load_state_dict(state_dict, strict=strict)
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
