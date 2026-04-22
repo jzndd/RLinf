@@ -57,6 +57,7 @@ class SupportedModel(Enum):
     GR00T = ("gr00t", "embodied")
     DEXBOTIC_PI = ("dexbotic_pi", "embodied")
     DREAMZERO = ("dreamzero", "embodied")
+    FASTWAM = ("fastwam", "embodied")
     CNN_POLICY = ("cnn_policy", "embodied")
     FLOW_POLICY = ("flow_policy", "embodied")
     CMA_POLICY = ("cma", "embodied")
