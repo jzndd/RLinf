@@ -22,10 +22,15 @@ export FASTWAM_ACTION_DIT_PATH="${FASTWAM_ACTION_DIT_PATH:-$FASTWAM_ROOT/checkpo
 export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-$FASTWAM_ROOT/checkpoints}"
 export PYTHONPATH="$FASTWAM_ROOT:$FASTWAM_ROOT/src:$REPO_PATH:${PYTHONPATH:-}"
 
-CONFIG_NAME="${CONFIG_NAME:-libero_spatial_eval_fastwam}"
 TOTAL_NUM_ENVS="${TOTAL_NUM_ENVS:-8}"
-LOG_DIR="${LOG_DIR:-$REPO_PATH/logs/fastwam/libero_spatial/$(date +'%Y%m%d-%H%M%S')}"
-LOG_FILE="$LOG_DIR/eval_embodiment.log"
+TIMESTAMP="$(date +'%Y%m%d-%H%M%S')"
+BASE_LOG_DIR="${BASE_LOG_DIR:-$REPO_PATH/logs/fastwam/$TIMESTAMP}"
+DEFAULT_CONFIGS=(
+  "libero_spatial_eval_fastwam"
+  "libero_goal_eval_fastwam"
+  "libero_object_eval_fastwam"
+  "libero_10_eval_fastwam"
+)
 
 required_paths=(
   "$FASTWAM_ROOT"
@@ -41,23 +46,46 @@ for path in "${required_paths[@]}"; do
   fi
 done
 
-mkdir -p "$LOG_DIR"
-
-CMD=(
-  python "$SRC_FILE"
-  --config-path "$EMBODIED_PATH/config"
-  --config-name "$CONFIG_NAME"
-  "runner.logger.log_path=$LOG_DIR"
-  "env.train.total_num_envs=$TOTAL_NUM_ENVS"
-  "env.eval.total_num_envs=$TOTAL_NUM_ENVS"
-)
-
-if [ "$#" -gt 0 ]; then
-  CMD+=("$@")
+if [ -n "${FASTWAM_EVAL_CONFIGS:-}" ]; then
+  read -r -a CONFIGS <<< "${FASTWAM_EVAL_CONFIGS}"
+else
+  CONFIGS=("${DEFAULT_CONFIGS[@]}")
 fi
 
-echo "Evaluation Mode: ${LIBERO_TYPE}"
-echo "Using ROBOT_PLATFORM=${ROBOT_PLATFORM}"
-echo "Log directory: ${LOG_DIR}"
-printf 'Running command:\n%s\n' "${CMD[*]}"
-"${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+mkdir -p "$BASE_LOG_DIR"
+
+run_eval() {
+  local config_name="$1"
+  shift
+
+  local suite_name="${config_name%_eval_fastwam}"
+  local suite_short="${suite_name#libero_}"
+  local log_dir="$BASE_LOG_DIR/${suite_short}"
+  local log_file="$log_dir/eval_embodiment.log"
+
+  mkdir -p "$log_dir"
+
+  local cmd=(
+    python "$SRC_FILE"
+    --config-path "$EMBODIED_PATH/config"
+    --config-name "$config_name"
+    "runner.logger.log_path=$log_dir"
+    "env.train.total_num_envs=$TOTAL_NUM_ENVS"
+    "env.eval.total_num_envs=$TOTAL_NUM_ENVS"
+  )
+
+  if [ "$#" -gt 0 ]; then
+    cmd+=("$@")
+  fi
+
+  echo "Evaluation Mode: ${LIBERO_TYPE}"
+  echo "Using ROBOT_PLATFORM=${ROBOT_PLATFORM}"
+  echo "Config: ${config_name}"
+  echo "Log directory: ${log_dir}"
+  printf 'Running command:\n%s\n' "${cmd[*]}"
+  "${cmd[@]}" 2>&1 | tee "$log_file"
+}
+
+for config_name in "${CONFIGS[@]}"; do
+  run_eval "$config_name" "$@"
+done
