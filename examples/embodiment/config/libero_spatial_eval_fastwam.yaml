@@ -46,7 +46,7 @@ algorithm:
 
   update_epoch: 1
   adv_type: grpo
-  loss_type: actor_critic
+  loss_type: actor
 
   gamma: 0.99
   gae_lambda: 0.95

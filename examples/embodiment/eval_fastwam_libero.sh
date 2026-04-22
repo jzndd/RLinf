@@ -3,6 +3,7 @@ set -euo pipefail
 
 EMBODIED_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(dirname "$(dirname "$EMBODIED_PATH")")"
+SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
 source /opt/venv/openpi/bin/activate
 
@@ -11,6 +12,8 @@ export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
 export MUJOCO_GL="osmesa"
 export PYOPENGL_PLATFORM="osmesa"
+export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
+export LIBERO_TYPE="${LIBERO_TYPE:-standard}"
 
 export FASTWAM_ROOT="${FASTWAM_ROOT:-/mnt/project_rlinf/jzn/workspace/FastWAM}"
 export FASTWAM_MODEL_PATH="${FASTWAM_MODEL_PATH:-/mnt/project_rlinf/jlchen/code/FastWAM/checkpoints/fastwam_release/libero_uncond_2cam224.pt}"
@@ -22,7 +25,7 @@ export PYTHONPATH="$FASTWAM_ROOT:$FASTWAM_ROOT/src:$REPO_PATH:${PYTHONPATH:-}"
 CONFIG_NAME="${CONFIG_NAME:-libero_spatial_eval_fastwam}"
 TOTAL_NUM_ENVS="${TOTAL_NUM_ENVS:-8}"
 LOG_DIR="${LOG_DIR:-$REPO_PATH/logs/fastwam/libero_spatial/$(date +'%Y%m%d-%H%M%S')}"
-LOG_FILE="$LOG_DIR/eval_fastwam_libero.log"
+LOG_FILE="$LOG_DIR/eval_embodiment.log"
 
 required_paths=(
   "$FASTWAM_ROOT"
@@ -41,7 +44,7 @@ done
 mkdir -p "$LOG_DIR"
 
 CMD=(
-  python "$EMBODIED_PATH/eval_embodied_agent.py"
+  python "$SRC_FILE"
   --config-path "$EMBODIED_PATH/config"
   --config-name "$CONFIG_NAME"
   "runner.logger.log_path=$LOG_DIR"
@@ -53,5 +56,8 @@ if [ "$#" -gt 0 ]; then
   CMD+=("$@")
 fi
 
+echo "Evaluation Mode: ${LIBERO_TYPE}"
+echo "Using ROBOT_PLATFORM=${ROBOT_PLATFORM}"
+echo "Log directory: ${LOG_DIR}"
 printf 'Running command:\n%s\n' "${CMD[*]}"
 "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
