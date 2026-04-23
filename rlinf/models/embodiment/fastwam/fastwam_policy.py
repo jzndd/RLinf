@@ -29,6 +29,78 @@ class FastWAMPolicy(nn.Module, BasePolicy):
         self.score_weighted_by_scheduler = bool(
             cfg.get("score_weighted_by_scheduler", True)
         )
+        self.score_video_cache_no_grad = bool(
+            cfg.get("score_video_cache_no_grad", True)
+        )
+        self._frozen_modules: list[nn.Module] = []
+        self._configure_trainable_modules()
+
+    def _set_module_trainability(
+        self,
+        module: nn.Module | None,
+        trainable: bool,
+    ) -> None:
+        if module is None:
+            return
+        module.requires_grad_(trainable)
+        if trainable:
+            module.train()
+            return
+        module.eval()
+        self._frozen_modules.append(module)
+
+    def _configure_trainable_modules(self) -> None:
+        if bool(self.cfg.get("is_lora", False)):
+            self.model.requires_grad_(False)
+            for name, param in self.model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad_(True)
+
+            proprio_encoder = getattr(self.model, "proprio_encoder", None)
+            if bool(self.cfg.get("train_proprio_encoder", False)):
+                self._set_module_trainability(proprio_encoder, True)
+            else:
+                self._set_module_trainability(proprio_encoder, False)
+
+            self._set_module_trainability(self.model.text_encoder, False)
+            self._set_module_trainability(self.model.vae, False)
+            return
+
+        self.model.requires_grad_(False)
+        self._set_module_trainability(
+            self.model.mot,
+            bool(self.cfg.get("train_mot", True)),
+        )
+        self._set_module_trainability(
+            self.model.action_expert,
+            bool(self.cfg.get("train_action_expert", True)),
+        )
+        self._set_module_trainability(
+            self.model.video_expert,
+            bool(self.cfg.get("train_video_expert", False)),
+        )
+        self._set_module_trainability(
+            getattr(self.model, "proprio_encoder", None),
+            bool(self.cfg.get("train_proprio_encoder", True)),
+        )
+        self._set_module_trainability(
+            self.model.text_encoder,
+            bool(self.cfg.get("train_text_encoder", False)),
+        )
+        self._set_module_trainability(
+            self.model.vae,
+            bool(self.cfg.get("train_vae", False)),
+        )
+        self._restore_frozen_eval_mode()
+
+    def _restore_frozen_eval_mode(self) -> None:
+        for module in self._frozen_modules:
+            module.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._restore_frozen_eval_mode()
+        return self
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         del assign
@@ -108,7 +180,10 @@ class FastWAMPolicy(nn.Module, BasePolicy):
         if isinstance(value, np.ndarray):
             return value
         if torch.is_tensor(value):
-            return value.detach().cpu().numpy()
+            tensor = value.detach()
+            if tensor.is_floating_point():
+                tensor = tensor.to(dtype=torch.float32)
+            return tensor.cpu().numpy()
         return np.asarray(value)
 
     @staticmethod
@@ -145,7 +220,25 @@ class FastWAMPolicy(nn.Module, BasePolicy):
         state_batch = self.processor.normalizer.forward(state_batch)
         return state_batch["state"][state_key]
 
+    def _normalize_action_chunk_shape(self, action: torch.Tensor) -> torch.Tensor:
+        if action.ndim == 3:
+            if action.shape[0] != 1:
+                raise ValueError(
+                    "Expected a single-sample action tensor with shape [1, T, D], "
+                    f"got {tuple(action.shape)}"
+                )
+            action = action[0]
+        if action.ndim == 1:
+            action = action.unsqueeze(0)
+        if action.ndim != 2:
+            raise ValueError(
+                "Expected action tensor with shape [T, D] for a single sample, "
+                f"got {tuple(action.shape)}"
+            )
+        return action
+
     def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
+        action = self._normalize_action_chunk_shape(action)
         if action.ndim == 2:
             action = action.unsqueeze(0)
         if action.ndim != 3:
@@ -242,6 +335,46 @@ class FastWAMPolicy(nn.Module, BasePolicy):
             )
         return torch.cat(image_batch, dim=0)
 
+    def _encode_input_image_latents_batch(self, input_images: torch.Tensor) -> torch.Tensor:
+        if input_images.ndim != 4 or input_images.shape[1] != 3:
+            raise ValueError(
+                "Expected batched input images with shape [B, 3, H, W], "
+                f"got {tuple(input_images.shape)}"
+            )
+
+        latent_batch = []
+        for idx in range(int(input_images.shape[0])):
+            latent_batch.append(
+                self.model._encode_input_image_latents_tensor(
+                    input_image=input_images[idx : idx + 1],
+                    tiled=bool(self.cfg.get("tiled", False)),
+                )
+            )
+        return torch.cat(latent_batch, dim=0)
+
+    @staticmethod
+    def _group_sample_indices(condition_group_ids: torch.Tensor) -> list[list[int]]:
+        group_ids = condition_group_ids.detach().cpu().tolist()
+        grouped_indices: dict[int, list[int]] = {}
+        for sample_idx, group_id in enumerate(group_ids):
+            grouped_indices.setdefault(int(group_id), []).append(sample_idx)
+        return list(grouped_indices.values())
+
+    @staticmethod
+    def _expand_video_kv_cache(
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        batch_size: int,
+    ) -> list[dict[str, torch.Tensor]]:
+        expanded_cache = []
+        for layer_cache in video_kv_cache:
+            expanded_cache.append(
+                {
+                    "k": layer_cache["k"].expand(batch_size, -1, -1),
+                    "v": layer_cache["v"].expand(batch_size, -1, -1),
+                }
+            )
+        return expanded_cache
+
     def _tokenize_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         if self.model.tokenizer is None:
             raise ValueError(
@@ -279,10 +412,14 @@ class FastWAMPolicy(nn.Module, BasePolicy):
         input_images: torch.Tensor,
         prompt_input_ids: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
+        prompt_context: torch.Tensor | None,
+        prompt_context_mask: torch.Tensor | None,
         proprio: torch.Tensor | None,
         actions: torch.Tensor,
         action_noise: torch.Tensor,
         action_timesteps: torch.Tensor,
+        first_frame_latents: torch.Tensor | None,
+        condition_group_ids: torch.Tensor | None,
     ) -> torch.Tensor:
         model_dtype = self.model.torch_dtype
         model_device = self.model.device
@@ -292,28 +429,40 @@ class FastWAMPolicy(nn.Module, BasePolicy):
         action_noise = action_noise.to(device=model_device, dtype=model_dtype)
         action_timesteps = action_timesteps.to(device=model_device, dtype=model_dtype)
 
-        context, context_mask = self._encode_prompt_tokens(
-            prompt_ids=prompt_input_ids,
-            prompt_mask=prompt_attention_mask,
-        )
+        if prompt_context is None or prompt_context_mask is None:
+            context, context_mask = self._encode_prompt_tokens(
+                prompt_ids=prompt_input_ids,
+                prompt_mask=prompt_attention_mask,
+            )
+        else:
+            context = prompt_context.to(device=model_device, dtype=model_dtype)
+            context_mask = prompt_context_mask.to(
+                device=model_device,
+                dtype=torch.bool,
+            )
         if proprio is not None:
             proprio = proprio.to(device=model_device, dtype=model_dtype)
-            context, context_mask = self.model._append_proprio_to_context(
-                context=context,
-                context_mask=context_mask,
-                proprio=proprio,
+        if first_frame_latents is not None:
+            first_frame_latents = first_frame_latents.to(
+                device=model_device,
+                dtype=model_dtype,
             )
-
-        first_frame_latents = self.model._encode_input_image_latents_tensor(
-            input_image=input_images,
-            tiled=bool(self.cfg.get("tiled", False)),
-        )
-        fuse_flag = bool(getattr(self.model.video_expert, "fuse_vae_embedding_in_latents", False))
-        timestep_video = torch.zeros(
-            (actions.shape[0],),
-            dtype=first_frame_latents.dtype,
-            device=model_device,
-        )
+        if condition_group_ids is None:
+            condition_group_ids = torch.arange(
+                actions.shape[0],
+                device=model_device,
+                dtype=torch.long,
+            )
+        else:
+            condition_group_ids = condition_group_ids.to(
+                device=model_device,
+                dtype=torch.long,
+            ).reshape(-1)
+        if condition_group_ids.shape[0] != actions.shape[0]:
+            raise ValueError(
+                "condition_group_ids batch size mismatch: "
+                f"expected {actions.shape[0]}, got {condition_group_ids.shape[0]}"
+            )
 
         noisy_actions = self.model.train_action_scheduler.add_noise(
             actions,
@@ -326,52 +475,119 @@ class FastWAMPolicy(nn.Module, BasePolicy):
             action_timesteps,
         )
 
-        video_pre = self.model.video_expert.pre_dit(
-            x=first_frame_latents,
-            timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
-            action=None,
-            fuse_vae_embedding_in_latents=fuse_flag,
+        fuse_flag = bool(
+            getattr(self.model.video_expert, "fuse_vae_embedding_in_latents", False)
         )
-        action_pre = self.model.action_expert.pre_dit(
-            action_tokens=noisy_actions,
-            timestep=action_timesteps,
-            context=context,
-            context_mask=context_mask,
-        )
-        attention_mask = self.model._build_mot_attention_mask(
-            video_seq_len=video_pre["tokens"].shape[1],
-            action_seq_len=action_pre["tokens"].shape[1],
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=model_device,
-        )
-        tokens_out = self.model.mot(
-            embeds_all={
-                "video": video_pre["tokens"],
-                "action": action_pre["tokens"],
-            },
-            attention_mask=attention_mask,
-            freqs_all={
-                "video": video_pre["freqs"],
-                "action": action_pre["freqs"],
-            },
-            context_all={
-                "video": {
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
-                },
-                "action": {
+        pred_actions_by_index: list[torch.Tensor | None] = [None] * int(actions.shape[0])
+        for sample_indices in self._group_sample_indices(condition_group_ids):
+            first_idx = int(sample_indices[0])
+            group_size = len(sample_indices)
+            group_context = context[first_idx : first_idx + 1]
+            group_context_mask = context_mask[first_idx : first_idx + 1]
+            if proprio is not None:
+                group_context, group_context_mask = self.model._append_proprio_to_context(
+                    context=group_context,
+                    context_mask=group_context_mask,
+                    proprio=proprio[first_idx : first_idx + 1],
+                )
+
+            if first_frame_latents is None:
+                group_first_frame_latents = self._encode_input_image_latents_batch(
+                    input_images[first_idx : first_idx + 1]
+                )
+            else:
+                group_first_frame_latents = first_frame_latents[first_idx : first_idx + 1]
+
+            group_noisy_actions = noisy_actions[sample_indices]
+            group_action_timesteps = action_timesteps[sample_indices]
+            group_context_batch = group_context.expand(group_size, -1, -1)
+            group_context_mask_batch = group_context_mask.expand(group_size, -1)
+            action_pre = self.model.action_expert.pre_dit(
+                action_tokens=group_noisy_actions,
+                timestep=group_action_timesteps,
+                context=group_context_batch,
+                context_mask=group_context_mask_batch,
+            )
+
+            group_context_for_video = group_context
+
+            def _build_group_video_cache(
+                video_context: torch.Tensor,
+            ) -> tuple[
+                list[dict[str, torch.Tensor]],
+                torch.Tensor,
+                int,
+            ]:
+                timestep_video = torch.zeros(
+                    (1,),
+                    dtype=group_first_frame_latents.dtype,
+                    device=model_device,
+                )
+                video_pre = self.model.video_expert.pre_dit(
+                    x=group_first_frame_latents,
+                    timestep=timestep_video,
+                    context=video_context,
+                    context_mask=group_context_mask,
+                    action=None,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                )
+                video_seq_len = int(video_pre["tokens"].shape[1])
+                attention_mask = self.model._build_mot_attention_mask(
+                    video_seq_len=video_seq_len,
+                    action_seq_len=action_pre["tokens"].shape[1],
+                    video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+                    device=model_device,
+                )
+                video_kv_cache = self.model.mot.prefill_video_cache(
+                    video_tokens=video_pre["tokens"],
+                    video_freqs=video_pre["freqs"],
+                    video_t_mod=video_pre["t_mod"],
+                    video_context_payload={
+                        "context": video_pre["context"],
+                        "mask": video_pre["context_mask"],
+                    },
+                    video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+                )
+                return video_kv_cache, attention_mask, video_seq_len
+
+            # Treat video K/V as shared conditioning so only the action branch keeps
+            # the backward graph for each GRPO sample in the group.
+            if self.score_video_cache_no_grad:
+                group_first_frame_latents = group_first_frame_latents.detach()
+                group_context_for_video = group_context.detach()
+                with torch.no_grad():
+                    video_kv_cache, attention_mask, video_seq_len = (
+                        _build_group_video_cache(group_context_for_video)
+                    )
+            else:
+                video_kv_cache, attention_mask, video_seq_len = (
+                    _build_group_video_cache(group_context_for_video)
+                )
+            action_tokens = self.model.mot.forward_action_with_video_cache(
+                action_tokens=action_pre["tokens"],
+                action_freqs=action_pre["freqs"],
+                action_t_mod=action_pre["t_mod"],
+                action_context_payload={
                     "context": action_pre["context"],
                     "mask": action_pre["context_mask"],
                 },
-            },
-            t_mod_all={
-                "video": video_pre["t_mod"],
-                "action": action_pre["t_mod"],
-            },
+                video_kv_cache=self._expand_video_kv_cache(video_kv_cache, group_size),
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+            )
+            group_pred_actions = self.model.action_expert.post_dit(
+                action_tokens,
+                action_pre,
+            )
+            for group_offset, sample_idx in enumerate(sample_indices):
+                pred_actions_by_index[sample_idx] = group_pred_actions[group_offset]
+
+        if any(pred_action is None for pred_action in pred_actions_by_index):
+            raise ValueError("Failed to compute FASTWAM action scores for all samples.")
+        pred_actions = torch.stack(
+            [pred_action for pred_action in pred_actions_by_index if pred_action is not None],
+            dim=0,
         )
-        pred_actions = self.model.action_expert.post_dit(tokens_out["action"], action_pre)
 
         if self.score_loss_type in {"l1", "l1_loss"}:
             per_dim_loss = torch.abs(
@@ -405,10 +621,14 @@ class FastWAMPolicy(nn.Module, BasePolicy):
             input_images=forward_inputs["input_images"],
             prompt_input_ids=forward_inputs["prompt_input_ids"],
             prompt_attention_mask=forward_inputs["prompt_attention_mask"],
+            prompt_context=forward_inputs.get("prompt_context"),
+            prompt_context_mask=forward_inputs.get("prompt_context_mask"),
             proprio=forward_inputs.get("proprio"),
             actions=forward_inputs["actions"],
             action_noise=forward_inputs["action_noise"],
             action_timesteps=forward_inputs["action_timesteps"],
+            first_frame_latents=forward_inputs.get("first_frame_latents"),
+            condition_group_ids=forward_inputs.get("condition_group_ids"),
         )
 
         result: dict[str, Any] = {"logprobs": logprobs}
@@ -453,7 +673,25 @@ class FastWAMPolicy(nn.Module, BasePolicy):
         prompts = [DEFAULT_PROMPT.format(task=task) for task in task_descriptions]
         normalized_states = self._normalize_proprio(states)
         prompt_input_ids, prompt_attention_mask = self._tokenize_prompts(prompts)
+        condition_group_ids = env_obs.get("condition_group_ids")
+        if condition_group_ids is None:
+            condition_group_ids = torch.arange(batch_size, dtype=torch.long)
+        else:
+            condition_group_ids = torch.as_tensor(
+                self._to_numpy(condition_group_ids),
+                dtype=torch.long,
+            ).reshape(-1)
+        if condition_group_ids.shape[0] != batch_size:
+            raise ValueError(
+                "condition_group_ids length mismatch: "
+                f"expected {batch_size}, got {condition_group_ids.shape[0]}"
+            )
         input_images = self._build_input_image_batch(main_images, wrist_images)
+        prompt_context, prompt_context_mask = self._encode_prompt_tokens(
+            prompt_ids=prompt_input_ids,
+            prompt_mask=prompt_attention_mask,
+        )
+        first_frame_latents = self._encode_input_image_latents_batch(input_images)
 
         normalized_actions = []
         actions = []
@@ -477,10 +715,9 @@ class FastWAMPolicy(nn.Module, BasePolicy):
                 rand_device=str(self.cfg.get("rand_device", "cpu")),
                 tiled=bool(self.cfg.get("tiled", False)),
             )
-            normalized_action = prediction["action"][0, : self.num_action_chunks].to(
-                dtype=torch.float32,
-                device="cpu",
-            )
+            normalized_action = self._normalize_action_chunk_shape(prediction["action"])[
+                : self.num_action_chunks
+            ].to(dtype=torch.float32, device="cpu")
             normalized_actions.append(normalized_action)
             actions.append(self._postprocess_action(normalized_action))
 
@@ -497,10 +734,17 @@ class FastWAMPolicy(nn.Module, BasePolicy):
             "input_images": input_images.to(dtype=torch.float32, device="cpu"),
             "prompt_input_ids": prompt_input_ids.to(device="cpu"),
             "prompt_attention_mask": prompt_attention_mask.to(device="cpu"),
+            "prompt_context": prompt_context.to(dtype=torch.float32, device="cpu"),
+            "prompt_context_mask": prompt_context_mask.to(device="cpu"),
             "proprio": normalized_states.to(dtype=torch.float32, device="cpu"),
             "actions": normalized_actions_tensor,
             "action_noise": action_noise,
             "action_timesteps": action_timesteps,
+            "condition_group_ids": condition_group_ids.to(device="cpu"),
+            "first_frame_latents": first_frame_latents.to(
+                dtype=torch.float32,
+                device="cpu",
+            ),
         }
         prev_logprobs = self.default_forward(
             forward_inputs=forward_inputs,

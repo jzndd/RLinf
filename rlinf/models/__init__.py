@@ -57,11 +57,9 @@ def get_model(cfg: DictConfig):
         from peft import LoraConfig, PeftModel, get_peft_model
 
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
-            lora_config = LoraConfig(
-                r=cfg.lora_rank,
-                lora_alpha=cfg.lora_rank,
-                lora_dropout=0.0,
-                target_modules=[
+            target_modules = cfg.get(
+                "lora_target_modules",
+                [
                     "proj",
                     "qkv",
                     "fc1",
@@ -79,6 +77,12 @@ def get_model(cfg: DictConfig):
                     "down_proj",
                     "lm_head",  # llm
                 ],
+            )
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=cfg.lora_rank,
+                lora_dropout=0.0,
+                target_modules=target_modules,
                 init_lora_weights="gaussian",
             )
             if model_type == SupportedModel.OPENPI:
