@@ -26,6 +26,8 @@ text_cfg_scale: 1.0
 negative_prompt: ""
 rand_device: "cpu"
 tiled: false
+score_loss_type: "l1_loss"
+score_weighted_by_scheduler: true
 
 processor:
   _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
