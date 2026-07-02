@@ -57,7 +57,6 @@ class SupportedModel(Enum):
     GR00T = ("gr00t", "embodied")
     DEXBOTIC_PI = ("dexbotic_pi", "embodied")
     DREAMZERO = ("dreamzero", "embodied")
-    FASTWAM = ("fastwam", "embodied")
     CNN_POLICY = ("cnn_policy", "embodied")
     FLOW_POLICY = ("flow_policy", "embodied")
     CMA_POLICY = ("cma", "embodied")
@@ -772,12 +771,15 @@ def validate_embodied_cfg(cfg):
     stage_num = cfg.rollout.pipeline_stage_num
     env_world_size = component_placement.get_world_size("env")
 
+    print(f"env_world_size: {env_world_size}, stage_num: {stage_num}, cfg.env.eval.total_num_envs: {cfg.env.eval.total_num_envs}, cfg.env.eval.group_size: {cfg.env.eval.group_size}",
+          f"cfg.env.train.total_num_envs: {cfg.env.train.total_num_envs}, cfg.env.train.group_size: {cfg.env.train.group_size}")
+
     if cfg.runner.val_check_interval > 0 or cfg.runner.only_eval:
         assert cfg.env.eval.total_num_envs > 0, (
             "Total number of parallel environments for evaluation must be greater than 0"
         )
         assert cfg.env.eval.total_num_envs % env_world_size == 0, (
-            "Total number of parallel environments for evaluation must be divisible by the number of environment processes"
+            f"Total number of parallel environments for evaluation must be divisible by the number of environment processes, got {cfg.env.eval.total_num_envs} % {env_world_size} != 0"
         )
         assert cfg.env.eval.total_num_envs % env_world_size % stage_num == 0, (
             "Total number of parallel environments for evaluation must be divisible by the number of environment processes and the number of pipeline stages"

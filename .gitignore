@@ -20,3 +20,12 @@ uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
+
+logs_10/*
+logs_goal/*
+logs_object/*
+logs_long/*
+logs_spatial/*
+
+=12.4
+=470,driver

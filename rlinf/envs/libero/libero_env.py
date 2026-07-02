@@ -15,6 +15,7 @@
 import copy
 import glob
 import importlib
+import json
 import os
 import sys
 from typing import Optional, Union
@@ -90,6 +91,9 @@ class LiberoEnv(gym.Env):
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.specific_reset_id = cfg.get("specific_reset_id", None)
+        self.eval_reset_state_ids = self._parse_eval_reset_state_ids(
+            cfg.get("eval_reset_state_ids", None)
+        )
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -115,6 +119,25 @@ class LiberoEnv(gym.Env):
 
         self.video_cfg = cfg.video_cfg
         self.current_raw_obs = None
+
+    @staticmethod
+    def _parse_eval_reset_state_ids(raw_ids):
+        if raw_ids is None:
+            return None
+        if isinstance(raw_ids, str):
+            stripped = raw_ids.strip()
+            if stripped == "":
+                return None
+            parsed = json.loads(stripped)
+            if isinstance(parsed, (int, np.integer)):
+                parsed = [int(parsed)]
+            raw_ids = parsed
+        if isinstance(raw_ids, (int, np.integer)):
+            raw_ids = [int(raw_ids)]
+        ids = np.asarray(raw_ids, dtype=int).reshape(-1)
+        if ids.size == 0:
+            return None
+        return ids
 
     def _init_env(self):
         env_fns = self.get_env_fns()
@@ -376,6 +399,10 @@ class LiberoEnv(gym.Env):
             reset_state_ids = self.specific_reset_id * np.ones(
                 (num_reset_states,), dtype=int
             )
+        elif self.eval_reset_state_ids is not None:
+            reset_state_ids = self._generator.choice(
+                self.eval_reset_state_ids, size=(num_reset_states,), replace=True
+            )
         else:
             reset_state_ids = self._generator.integers(
                 low=0, high=self.total_num_group_envs, size=(num_reset_states,)
@@ -383,10 +410,19 @@ class LiberoEnv(gym.Env):
         return reset_state_ids
 
     def get_reset_state_ids_all(self):
-        reset_state_ids = np.arange(self.total_num_group_envs)
-        valid_size = len(reset_state_ids) - (
-            len(reset_state_ids) % self.total_num_processes
-        )
+        if self.eval_reset_state_ids is not None:
+            reset_state_ids = self.eval_reset_state_ids.copy()
+        else:
+            reset_state_ids = np.arange(self.total_num_group_envs)
+        remainder = len(reset_state_ids) % self.total_num_processes
+        if remainder != 0:
+            # Keep all requested ids and pad to process-aligned size.
+            pad_size = self.total_num_processes - remainder
+            pad_vals = self._generator_ordered.choice(
+                reset_state_ids, size=pad_size, replace=True
+            )
+            reset_state_ids = np.concatenate([reset_state_ids, pad_vals], axis=0)
+        valid_size = len(reset_state_ids)
         self._generator_ordered.shuffle(reset_state_ids)
         reset_state_ids = reset_state_ids[:valid_size]
         reset_state_ids = reset_state_ids.reshape(self.total_num_processes, -1)
@@ -453,6 +489,7 @@ class LiberoEnv(gym.Env):
         self.success_once = np.zeros(self.num_envs, dtype=bool)
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
+        self.reset_state_ids_current = np.zeros(self.num_envs, dtype=np.int64)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -475,6 +512,7 @@ class LiberoEnv(gym.Env):
         self.returns += step_reward
         self.success_once = self.success_once | terminations
         episode_info["success_once"] = self.success_once.copy()
+        episode_info["reset_state_id"] = self.reset_state_ids_current.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
@@ -564,8 +602,11 @@ class LiberoEnv(gym.Env):
         if reset_state_ids is None:
             num_reset_states = len(env_idx)
             reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
+        else:
+            reset_state_ids = np.asarray(reset_state_ids, dtype=np.int64).reshape(-1)
 
         self._reconfigure(reset_state_ids, env_idx)
+        self.reset_state_ids_current[np.asarray(env_idx)] = reset_state_ids
         for _ in range(15):
             zero_actions = np.zeros((len(env_idx), 7))
             if self.cfg.reset_gripper_open:

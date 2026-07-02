@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -78,6 +79,9 @@ class OpenPIGRPODataset(Dataset[OpenPIGRPOItem]):
         self.chunk_size = int(self.info["chunks_size"])
 
         self.task_text_by_index = self._load_tasks(self.meta_dir / "tasks.jsonl")
+        self.task_index_by_text = {
+            task_text: task_index for task_index, task_text in self.task_text_by_index.items()
+        }
         self.episode_records = self._load_jsonl(self.meta_dir / "episodes.jsonl")
         self.sample_index = self._build_sample_index()
         self.episode_cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
@@ -135,12 +139,31 @@ class OpenPIGRPODataset(Dataset[OpenPIGRPOItem]):
                 tasks[int(record["task_index"])] = str(record["task"])
         return tasks
 
+    def _task_index_from_episode_record(self, record: dict[str, Any]) -> int:
+        if self.task_index_key in record:
+            return int(record[self.task_index_key])
+
+        task_descs = record.get("tasks", [])
+        if not task_descs:
+            raise KeyError(
+                f"Episode record {record.get('episode_index')} does not contain "
+                f"'{self.task_index_key}' or non-empty 'tasks'."
+            )
+
+        task_desc = str(task_descs[0])
+        if task_desc not in self.task_index_by_text:
+            raise KeyError(
+                f"Task description from episode record is not in tasks.jsonl: {task_desc}"
+            )
+        return int(self.task_index_by_text[task_desc])
+
     def _build_sample_index(self) -> list[tuple[int, int]]:
         sample_index: list[tuple[int, int]] = []
         for record in self.episode_records:
             episode_index = int(record["episode_index"])
             episode_length = int(record["length"])
-            valid_starts = episode_length - self.action_chunk + 1
+            required_frames = self.action_chunk
+            valid_starts = episode_length - required_frames + 1
             if valid_starts <= 0:
                 continue
             for start_frame in range(valid_starts):
@@ -173,6 +196,157 @@ class OpenPIGRPODataset(Dataset[OpenPIGRPOItem]):
         image = image.convert("RGB")
         array = np.array(image, dtype=np.uint8, copy=True)
         return torch.from_numpy(array)
+
+
+class ContinualLearningOpenPIGRPODataset(OpenPIGRPODataset):
+    """Deterministic task-subset view over one full OpenPI/LeRobot dataset."""
+
+    def __init__(
+        self,
+        data_paths: str | list[str],
+        config: DictConfig,
+    ) -> None:
+        super().__init__(data_paths, config)
+
+        subset_id = int(self.cfg.data.get("continual_subset_id", 1))
+        initial_task_count = int(self.cfg.data.get("continual_initial_task_count", 6))
+        new_task_traj = int(self.cfg.data.get("new_task_traj", 10))
+        old_task_traj = int(self.cfg.data.get("old_task_traj", 5))
+        replay_seed = int(self.cfg.data.get("continual_replay_seed", 0))
+        eval_all_task_episodes = bool(
+            self.cfg.data.get("continual_eval_full_dataset", False)
+        )
+
+        (
+            self.episode_records,
+            self.continual_selected_episodes,
+            self.continual_selection_summary,
+        ) = self.select_episodes(
+            records=self.episode_records,
+            task_text_by_index=self.task_text_by_index,
+            task_index_key=self.task_index_key,
+            subset_id=subset_id,
+            initial_task_count=initial_task_count,
+            new_task_traj=new_task_traj,
+            old_task_traj=old_task_traj,
+            replay_seed=replay_seed,
+            eval_all_task_episodes=eval_all_task_episodes,
+        )
+        self.sample_index = self._build_sample_index()
+
+    @classmethod
+    def select_episodes(
+        cls,
+        *,
+        records: list[dict[str, Any]],
+        task_text_by_index: dict[int, str],
+        task_index_key: str,
+        subset_id: int,
+        initial_task_count: int,
+        new_task_traj: int,
+        old_task_traj: int,
+        replay_seed: int,
+        eval_all_task_episodes: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[int], dict[int, int]]:
+        assert subset_id >= 1, "data.continual_subset_id must be >= 1"
+        assert initial_task_count >= 1, (
+            "data.continual_initial_task_count must be >= 1"
+        )
+        assert new_task_traj >= 0, "data.new_task_traj must be >= 0"
+        assert old_task_traj >= 0, "data.old_task_traj must be >= 0"
+
+        task_index_by_text = {
+            task_text: task_index for task_index, task_text in task_text_by_index.items()
+        }
+
+        def task_index_from_record(record: dict[str, Any]) -> int:
+            if task_index_key in record:
+                return int(record[task_index_key])
+
+            task_descs = record.get("tasks", [])
+            if not task_descs:
+                raise KeyError(
+                    f"Episode record {record.get('episode_index')} does not contain "
+                    f"'{task_index_key}' or non-empty 'tasks'."
+                )
+
+            task_desc = str(task_descs[0])
+            if task_desc not in task_index_by_text:
+                raise KeyError(
+                    "Task description from episode record is not in tasks.jsonl: "
+                    f"{task_desc}"
+                )
+            return int(task_index_by_text[task_desc])
+
+        if subset_id == 1:
+            new_task_ids = set(range(initial_task_count))
+            required_task_ids = list(range(initial_task_count))
+        else:
+            current_task_id = initial_task_count + subset_id - 2
+            new_task_ids = {current_task_id}
+            required_task_ids = list(range(current_task_id + 1))
+
+        records_by_task: dict[int, list[dict[str, Any]]] = {
+            task_id: [] for task_id in required_task_ids
+        }
+        for record in records:
+            task_id = task_index_from_record(record)
+            if task_id in records_by_task:
+                records_by_task[task_id].append(record)
+
+        selected_records: list[dict[str, Any]] = []
+        selection_summary: dict[int, int] = {}
+        for task_id in required_task_ids:
+            task_records = sorted(
+                records_by_task.get(task_id, []),
+                key=lambda record: int(record["episode_index"]),
+            )
+            if not task_records:
+                continue
+
+            if eval_all_task_episodes:
+                traj_limit = len(task_records)
+            else:
+                traj_limit = new_task_traj if task_id in new_task_ids else old_task_traj
+            if traj_limit <= 0:
+                continue
+
+            if len(task_records) > traj_limit:
+                task_records = sorted(
+                    task_records,
+                    key=lambda record: cls._stable_replay_key(
+                        replay_seed=replay_seed,
+                        task_index=task_id,
+                        episode_index=int(record["episode_index"]),
+                    ),
+                )[:traj_limit]
+                task_records = sorted(
+                    task_records,
+                    key=lambda record: int(record["episode_index"]),
+                )
+
+            selected_records.extend(task_records)
+            selection_summary[task_id] = len(task_records)
+
+        assert selected_records, (
+            "Continual selection produced zero episodes. "
+            f"subset_id={subset_id}, initial_task_count={initial_task_count}, "
+            f"new_task_traj={new_task_traj}, old_task_traj={old_task_traj}"
+        )
+        selected_episode_ids = [
+            int(record["episode_index"]) for record in selected_records
+        ]
+        return selected_records, selected_episode_ids, selection_summary
+
+    @staticmethod
+    def _stable_replay_key(
+        *,
+        replay_seed: int,
+        task_index: int,
+        episode_index: int,
+    ) -> tuple[str, int]:
+        key = f"{replay_seed}:{task_index}:{episode_index}".encode("utf-8")
+        return hashlib.sha256(key).hexdigest(), episode_index
 
 
 def openpi_grpo_collate_fn(

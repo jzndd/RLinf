@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import typing
+from pathlib import Path
+
+import torch
 
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
@@ -52,6 +55,60 @@ class EmbodiedEvalRunner:
 
         self.logger = get_logger()
 
+    def _dump_per_episode_flags(self, eval_metrics_list):
+        if not eval_metrics_list:
+            return
+
+        reset_state_tensors = [
+            metrics["reset_state_id"]
+            for metrics in eval_metrics_list
+            if "reset_state_id" in metrics
+        ]
+        if not reset_state_tensors:
+            return
+
+        success_key = None
+        for candidate in ("success_once", ):
+            if any(candidate in metrics for metrics in eval_metrics_list):
+                success_key = candidate
+                break
+        if success_key is None:
+            return
+
+        success_tensors = [
+            metrics[success_key] for metrics in eval_metrics_list if success_key in metrics
+        ]
+        if not success_tensors:
+            return
+
+        reset_state_ids = (
+            torch.concat(reset_state_tensors)
+            .detach()
+            .cpu()
+            .to(dtype=torch.int64)
+            .tolist()
+        )
+        success_flags = (
+            torch.concat(success_tensors)
+            .detach()
+            .cpu()
+            .to(dtype=torch.int64)
+            .tolist()
+        )
+
+        row_count = min(len(reset_state_ids), len(success_flags))
+        if row_count == 0:
+            return
+
+        log_dir = Path(self.cfg.runner.logger.log_path)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        output_path = log_dir / "per_episode_flags.csv"
+        with output_path.open("w", encoding="utf-8") as f:
+            f.write("episode_idx,reset_state_id,success_flag\n")
+            for idx in range(row_count):
+                f.write(f"{idx},{reset_state_ids[idx]},{success_flags[idx]}\n")
+        self.logger.info(f"Per-episode flags saved to: {output_path}")
+
     def init_workers(self):
         rollout_handle = self.rollout.init_worker()
         env_handle = self.env.init_worker()
@@ -71,6 +128,7 @@ class EmbodiedEvalRunner:
         env_results = env_handle.wait()
         rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
+        self._dump_per_episode_flags(eval_metrics_list)
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
 

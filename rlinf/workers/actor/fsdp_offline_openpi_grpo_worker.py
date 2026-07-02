@@ -5,10 +5,11 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from omegaconf import DictConfig
-from torch.utils.data import DataLoader, DistributedSampler
+from omegaconf import DictConfig, OmegaConf, open_dict
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from rlinf.data.datasets.openpi_grpo import (
+    ContinualLearningOpenPIGRPODataset,
     OpenPIGRPODataset,
     openpi_grpo_collate_fn,
 )
@@ -116,14 +117,33 @@ class OfflineOpenPIGRPOActor(EmbodiedFSDPActor):
         self._data_iter_offset = 0
 
     def init_worker(self) -> None:
+        self._set_default_lr_scheduler_steps()
         self.setup_model_and_optimizer()
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._build_offline_grpo_dataloader()
 
+    def _set_default_lr_scheduler_steps(self) -> None:
+        optim_cfg = self.cfg.actor.optim
+        if optim_cfg.get("lr_scheduler", "constant") != "cosine":
+            return
+        if int(optim_cfg.get("total_training_steps", 0)) > 0:
+            return
+
+        total_training_steps = int(self.cfg.runner.max_epochs)
+        with open_dict(optim_cfg):
+            optim_cfg.total_training_steps = total_training_steps
+        self.log_info(
+            "actor.optim.total_training_steps is not set; "
+            f"use runner.max_epochs={total_training_steps} for cosine scheduler."
+        )
+
     def _build_offline_grpo_dataloader(self) -> None:
-        dataset = OpenPIGRPODataset(self.cfg.data.train_data_paths, self.cfg)
+        dataset_cls = OpenPIGRPODataset
+        if bool(self.cfg.data.get("use_continual_learning", False)):
+            dataset_cls = ContinualLearningOpenPIGRPODataset
+        dataset = dataset_cls(self.cfg.data.train_data_paths, self.cfg)
 
         sampler = None
         if dist.is_available() and dist.is_initialized():
@@ -197,12 +217,13 @@ class OfflineOpenPIGRPOActor(EmbodiedFSDPActor):
         super().load_checkpoint(load_path)
         self._load_data_state(load_path)
 
-    @Worker.timer("prepare_rollout_batch")
-    def prepare_rollout_batch(self) -> dict[str, float]:
-        batch = self._next_batch()
+    def _compute_offline_rewards_for_batch(
+        self,
+        batch: dict[str, Any],
+        group_size: int,
+    ) -> dict[str, Any]:
         obs = batch["obs"]
         gt_actions = batch["actions"].to(torch.float32)
-        group_size = int(self.cfg.algorithm.group_size)
         action_chunk = int(self.cfg.actor.model.num_action_chunks)
 
         repeated_obs = repeat_obs_for_grpo(obs, group_size)
@@ -219,23 +240,56 @@ class OfflineOpenPIGRPOActor(EmbodiedFSDPActor):
 
         sampled_actions = sampled_actions.to(torch.float32)
         prev_logprobs = result["prev_logprobs"].to(torch.float32)
+        _, mse = compute_mse_rewards(sampled_actions, repeated_gt_actions)
+        l1_rewards, l1, gripper_match = compute_l1_rewards(
+            sampled_actions,
+            repeated_gt_actions,
+        )
 
         reward_mode = str(self.cfg.algorithm.offline_reward_fn).lower()
         if reward_mode == "mse":
-            rewards, mse = compute_mse_rewards(sampled_actions, repeated_gt_actions)
-            l1 = torch.zeros_like(rewards)
-            gripper_match = torch.zeros_like(rewards)
+            rewards = -mse
         elif reward_mode == "l1":
-            rewards, l1, gripper_match = compute_l1_rewards(
-                sampled_actions,
-                repeated_gt_actions,
-            )
-            mse = torch.zeros_like(rewards)
+            rewards = l1_rewards
         else:
             raise ValueError(
                 "Unsupported offline_reward_fn: "
-                f"{self.cfg.algorithm.offline_reward_fn}. Expected one of ['mse', 'l1']."
+                f"{self.cfg.algorithm.offline_reward_fn}. "
+                "Expected one of ['mse', 'l1']."
             )
+
+        return {
+            "obs": obs,
+            "gt_actions": gt_actions,
+            "repeated_gt_actions": repeated_gt_actions,
+            "sampled_actions": sampled_actions,
+            "prev_logprobs": prev_logprobs,
+            "forward_inputs": result["forward_inputs"],
+            "rewards": rewards,
+            "mse": mse,
+            "l1": l1,
+            "l1_rewards": l1_rewards,
+            "gripper_match": gripper_match,
+            "reward_mode": reward_mode,
+        }
+
+    @Worker.timer("prepare_rollout_batch")
+    def prepare_rollout_batch(self) -> dict[str, float]:
+        batch = self._next_batch()
+        group_size = int(self.cfg.algorithm.group_size)
+        action_chunk = int(self.cfg.actor.model.num_action_chunks)
+        reward_outputs = self._compute_offline_rewards_for_batch(
+            batch=batch,
+            group_size=group_size,
+        )
+        gt_actions = reward_outputs["gt_actions"]
+        repeated_gt_actions = reward_outputs["repeated_gt_actions"]
+        rewards = reward_outputs["rewards"]
+        mse = reward_outputs["mse"]
+        l1 = reward_outputs["l1"]
+        l1_rewards = reward_outputs["l1_rewards"]
+        gripper_match = reward_outputs["gripper_match"]
+        reward_mode = reward_outputs["reward_mode"]
 
         rollout_epoch = int(self.cfg.algorithm.rollout_epoch)
         assert rollout_epoch == 1, (
@@ -244,8 +298,8 @@ class OfflineOpenPIGRPOActor(EmbodiedFSDPActor):
         )
 
         self.rollout_batch = build_offline_rollout_batch(
-            prev_logprobs=prev_logprobs,
-            forward_inputs=result["forward_inputs"],
+            prev_logprobs=reward_outputs["prev_logprobs"],
+            forward_inputs=reward_outputs["forward_inputs"],
             rewards=rewards,
             action_chunk=action_chunk,
         )
@@ -260,12 +314,82 @@ class OfflineOpenPIGRPOActor(EmbodiedFSDPActor):
             "reward_max": rewards.max().item(),
             "mse_mean": mse.mean().item(),
             "l1_mean": l1.mean().item(),
+            "l1_reward_mean": l1_rewards.mean().item(),
             "gripper_match_rate": gripper_match.mean().item(),
             "reward_mode_is_mse": 1.0 if reward_mode == "mse" else 0.0,
             "reward_mode_is_l1": 1.0 if reward_mode == "l1" else 0.0,
             "group_score_std": group_scores.std(dim=-1).mean().item(),
         }
         return all_reduce_dict(metrics, op=torch.distributed.ReduceOp.AVG)
+
+    @Worker.timer("run_dataset_offline_eval")
+    def run_dataset_offline_eval(self) -> dict[str, float]:
+        if not bool(self.cfg.data.get("if_offline_eval", False)):
+            return {}
+
+        eval_cfg = OmegaConf.create(OmegaConf.to_container(self.cfg, resolve=True))
+        with open_dict(eval_cfg):
+            eval_cfg.data.use_continual_learning = True
+            eval_cfg.data.continual_eval_full_dataset = True
+            eval_cfg.data.shuffle = False
+
+        dataset = ContinualLearningOpenPIGRPODataset(
+            eval_cfg.data.train_data_paths,
+            eval_cfg,
+        )
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        local_indices = list(range(rank, len(dataset), world_size))
+        local_dataset = Subset(dataset, local_indices)
+
+        eval_batch_size = int(self.cfg.data.get("eval_batch_size", self.prompt_batch_size))
+        eval_loader = DataLoader(
+            local_dataset,
+            batch_size=eval_batch_size,
+            shuffle=False,
+            num_workers=self.cfg.data.num_workers,
+            drop_last=False,
+            collate_fn=openpi_grpo_collate_fn,
+            pin_memory=True,
+        )
+
+        group_size = int(self.cfg.algorithm.group_size)
+        local_reward_sum = 0.0
+        local_reward_count = 0.0
+        local_sample_count = 0.0
+        local_episode_count = float(len(getattr(dataset, "continual_selected_episodes", []))) if rank == 0 else 0.0
+
+        was_training = self.model.training
+        with torch.no_grad():
+            for batch in eval_loader:
+                reward_outputs = self._compute_offline_rewards_for_batch(
+                    batch=batch,
+                    group_size=group_size,
+                )
+                rewards = reward_outputs["rewards"]
+                local_reward_sum += rewards.sum().item()
+                local_reward_count += float(rewards.numel())
+                local_sample_count += float(batch["actions"].shape[0])
+
+        if was_training:
+            self.model.train()
+
+        totals = {
+            "reward_sum": local_reward_sum,
+            "reward_count": local_reward_count,
+            "sample_count": local_sample_count,
+            "episode_count": local_episode_count,
+        }
+        if dist.is_available() and dist.is_initialized():
+            totals = all_reduce_dict(totals, op=torch.distributed.ReduceOp.SUM)
+
+        reward_count = max(float(totals["reward_count"]), 1.0)
+        return {
+            "reward_mean": float(totals["reward_sum"]) / reward_count,
+            "reward_count": float(totals["reward_count"]),
+            "sample_count": float(totals["sample_count"]),
+            "episode_count": float(totals["episode_count"]),
+        }
 
     @Worker.timer("compute_advantages_and_returns")
     def compute_advantages_and_returns(self) -> dict[str, float]:

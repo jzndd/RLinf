@@ -62,7 +62,8 @@ echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 
 BASE_LOG_DIR="${REPO_PATH}/logs/offline_grpo_testing" #/$(date +'%Y%m%d-%H:%M:%S')"
 
-# base policy testing
+# # base policy testing
+# CONFIG_NAME="libero_spatial_grpo_openpi_pi05"
 # LOG_DIR="${BASE_LOG_DIR}/libero_spatial/step_0/"
 # MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
 # mkdir -p "${LOG_DIR}"
@@ -70,60 +71,39 @@ BASE_LOG_DIR="${REPO_PATH}/logs/offline_grpo_testing" #/$(date +'%Y%m%d-%H:%M:%S
 # echo ${CMD}
 # ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
 
+# CONFIG_NAME="libero_object_grpo_openpi_pi05"
+# LOG_DIR="${BASE_LOG_DIR}/libero_spatial/step_0_test_object_cl"
+# MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
+# mkdir -p "${LOG_DIR}"
+# CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+# echo ${CMD}
+# ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
+
+# CONFIG_NAME="libero_goal_grpo_openpi_pi05"
+# LOG_DIR="${BASE_LOG_DIR}/libero_spatial/step_0_test_goal_cl"
+# MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
+# mkdir -p "${LOG_DIR}"
+# CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+# echo ${CMD}
+# ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
+
+# CONFIG_NAME="libero_10_grpo_openpi_pi05"
+# LOG_DIR="${BASE_LOG_DIR}/libero_spatial/step_0_test_long_cl"
+# MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
+# mkdir -p "${LOG_DIR}"
+# CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+# echo ${CMD}
+# ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
+
 # continual learning testing
-# BASE_CHECKPONIT_PATH="/mnt/project_rlinf/jzn/workspace/continual_learning/RLinf/logs/20260415-19:22:38-libero_spatial_offline_grpo_openpi_pi05/libero_spatial_offline_grpo_openpi_pi05/checkpoints"
-# STEPS=(1000)
-# for STEP in ${STEPS[@]}; do
-
-#     # EVAL 500 STEP performance
-#     CONFIG_NAME="libero_spatial_grpo_openpi_pi05"
-#     LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_130_after_2529e39/step_${STEP}" #/$(date +'%Y%m%d-%H:%M:%S')"
-#     MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
-#     CHECKPONIT_PATH="${BASE_CHECKPONIT_PATH}/global_step_${STEP}/actor/model_state_dict/full_weights.pt"
-#     mkdir -p "${LOG_DIR}"
-#     CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} runner.ckpt_path=${CHECKPONIT_PATH}"
-#     echo ${CMD}
-#     ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
-
-#     # EVAL 500 STEP performance
-#     CONFIG_NAME="libero_goal_grpo_openpi_pi05"
-#     LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_130_after_2529e39/step_${STEP}_test_goal_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
-#     MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
-#     CHECKPONIT_PATH="${BASE_CHECKPONIT_PATH}/global_step_${STEP}/actor/model_state_dict/full_weights.pt"
-#     mkdir -p "${LOG_DIR}"
-#     CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} runner.ckpt_path=${CHECKPONIT_PATH}"
-#     echo ${CMD}
-#     ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
-
-#     # EVAL 500 STEP performance
-#     CONFIG_NAME="libero_object_grpo_openpi_pi05"
-#     LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_130_after_2529e39/step_${STEP}_test_object_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
-#     MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
-#     CHECKPONIT_PATH="${BASE_CHECKPONIT_PATH}/global_step_${STEP}/actor/model_state_dict/full_weights.pt"
-#     mkdir -p "${LOG_DIR}"
-#     CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} runner.ckpt_path=${CHECKPONIT_PATH}"
-#     echo ${CMD}
-#     ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
-
-#     # EVAL 500 STEP performance
-#     CONFIG_NAME="libero_10_grpo_openpi_pi05"
-#     LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_130_after_2529e39/step_${STEP}_test_long_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
-#     MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
-#     CHECKPONIT_PATH="${BASE_CHECKPONIT_PATH}/global_step_${STEP}/actor/model_state_dict/full_weights.pt"
-#     mkdir -p "${LOG_DIR}"
-#     CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} runner.ckpt_path=${CHECKPONIT_PATH}"
-#     echo ${CMD}
-#     ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
-# done
-
-
-BASE_CHECKPONIT_PATH="/mnt/project_rlinf/jzn/workspace/continual_learning/RLinf/logs/20260415-14:23:05-libero_130_offline_grpo_openpi_pi05/libero_130_offline_grpo_openpi_pi05/checkpoints"
-STEPS=(3000)
+# BASE_CHECKPONIT_PATH="/mnt/project_rlinf/jzn/workspace/continual_learning/RLinf/logs/20260415-13:18:48-libero_spatial_offline_grpo_openpi_pi05/libero_spatial_offline_grpo_openpi_pi05/checkpoints"
+BASE_CHECKPONIT_PATH="/mnt/project_rlinf/jzn/workspace/continual_learning/RLinf/logs/20260416-12:52:13-libero_spatial_offline_grpo_openpi_pi05_noise_level0.8/libero_spatial_offline_grpo_openpi_pi05/checkpoints"
+STEPS=(500)
 for STEP in ${STEPS[@]}; do
 
     # EVAL 500 STEP performance
     CONFIG_NAME="libero_spatial_grpo_openpi_pi05"
-    LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_zero/step_${STEP}" #/$(date +'%Y%m%d-%H:%M:%S')"
+    LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_130_noise0_8/step_${STEP}" #/$(date +'%Y%m%d-%H:%M:%S')"
     MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
     CHECKPONIT_PATH="${BASE_CHECKPONIT_PATH}/global_step_${STEP}/actor/model_state_dict/full_weights.pt"
     mkdir -p "${LOG_DIR}"
@@ -131,9 +111,9 @@ for STEP in ${STEPS[@]}; do
     echo ${CMD}
     ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
 
-    # # EVAL 500 STEP performance
+    # EVAL 500 STEP performance
     CONFIG_NAME="libero_goal_grpo_openpi_pi05"
-    LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_zero/step_${STEP}_test_goal_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
+    LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_130_noise0_8/step_${STEP}_test_goal_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
     MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
     CHECKPONIT_PATH="${BASE_CHECKPONIT_PATH}/global_step_${STEP}/actor/model_state_dict/full_weights.pt"
     mkdir -p "${LOG_DIR}"
@@ -143,7 +123,7 @@ for STEP in ${STEPS[@]}; do
 
     # EVAL 500 STEP performance
     CONFIG_NAME="libero_object_grpo_openpi_pi05"
-    LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_zero/step_${STEP}_test_object_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
+    LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_130_noise0_8/step_${STEP}_test_object_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
     MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
     CHECKPONIT_PATH="${BASE_CHECKPONIT_PATH}/global_step_${STEP}/actor/model_state_dict/full_weights.pt"
     mkdir -p "${LOG_DIR}"
@@ -153,7 +133,7 @@ for STEP in ${STEPS[@]}; do
 
     # EVAL 500 STEP performance
     CONFIG_NAME="libero_10_grpo_openpi_pi05"
-    LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_zero/step_${STEP}_test_long_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
+    LOG_DIR="${BASE_LOG_DIR}/libero_spatial_base_130_noise0_8/step_${STEP}_test_long_cl" #/$(date +'%Y%m%d-%H:%M:%S')"
     MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
     CHECKPONIT_PATH="${BASE_CHECKPONIT_PATH}/global_step_${STEP}/actor/model_state_dict/full_weights.pt"
     mkdir -p "${LOG_DIR}"

@@ -66,6 +66,7 @@ def prepare_actions_for_maniskill(
 def prepare_actions_for_libero(
     raw_chunk_actions,
     model_type,
+    invert_gripper_action: bool = False,
 ) -> np.ndarray:
     chunk_actions = raw_chunk_actions
     if SupportedModel(model_type) in [
@@ -74,6 +75,8 @@ def prepare_actions_for_libero(
     ]:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
+    elif invert_gripper_action:
+        chunk_actions[..., -1] = chunk_actions[..., -1] * -1.0
     return chunk_actions
 
 
@@ -202,6 +205,7 @@ def prepare_actions(
     action_scale: float = 1.0,
     policy: str = "widowx_bridge",
     wm_env_type=None,
+    invert_gripper_action: bool = False,
 ) -> torch.Tensor | np.ndarray:
     raw_chunk_actions = (
         raw_chunk_actions.cpu().numpy()
@@ -214,6 +218,7 @@ def prepare_actions(
         chunk_actions = prepare_actions_for_libero(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
+            invert_gripper_action=invert_gripper_action,
         )
     elif env_type == SupportedEnvType.OPENSORAWM or env_type == SupportedEnvType.WANWM:
         # TODO: Implement prepare_actions_for_opensora_wm
@@ -221,6 +226,7 @@ def prepare_actions(
             chunk_actions = prepare_actions_for_libero(
                 raw_chunk_actions=raw_chunk_actions,
                 model_type=model_type,
+                invert_gripper_action=invert_gripper_action,
             )
         else:
             raise NotImplementedError(f"Env type {wm_env_type} not implemented")

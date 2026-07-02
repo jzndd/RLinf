@@ -10,16 +10,16 @@ source /opt/venv/openpi/bin/activate
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
 export TOKENIZERS_PARALLELISM=false
 
-CONFIG_NAME="libero_spatial_offline_grpo_openpi_pi05"
+CONFIG_NAME="libero_spatial_offline_grpo_openpi_pi05_noise"
 
 # CONFIG_NAME="libero_130_offline_grpo_openpi_pi05"
 
-RESUME_CKPT_PATH="/mnt/project_rlinf/jzn/workspace/continual_learning/RLinf/checkpoints/pi05_libero_almost_zero/full_weights.pt"
+# RESUME_CKPT_PATH="/mnt/project_rlinf/jzn/workspace/continual_learning/RLinf/checkpoints/pi05_libero_almost_zero/full_weights.pt"
 NUM_STEPS=5
 
 echo "Using Python at $(which python)"
 
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}_wo_vlm_step${NUM_STEPS}"
+LOG_DIR="${REPO_PATH}/logs/${CONFIG_NAME}_continual_learning_training"
 MEGA_LOG_FILE="${LOG_DIR}/run_offline_grpo_openpi.log"
 mkdir -p "${LOG_DIR}"
 
@@ -28,7 +28,6 @@ CMD=(
     --config-path "${EMBODIED_PATH}/config/"
     --config-name "${CONFIG_NAME}"
     runner.logger.log_path="${LOG_DIR}"
-    runner.ckpt_path="${RESUME_CKPT_PATH}"
     actor.model.num_steps="${NUM_STEPS}"
 )
 

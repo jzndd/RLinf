@@ -20,6 +20,14 @@ group_size: 1
 use_fixed_reset_state_ids: True
 use_ordered_reset_state_ids: False
 
+# Indicate the reset state id (related to the task_id and trial_id) want to be specified. (e.g. 
+# if set 0, the env always use the task 0 and trial 0 in the libero-spatial suite; 
+# if set null, the initial states will be sampled from the whole libero-spatial suite. )
+specific_reset_id: null # can be a number or null.
+# Optional list of reset_state_id used in eval to restrict tasks/episodes.
+# Example: [0,1,2,3]
+eval_reset_state_ids: null
+
 video_cfg:
   save_video: True
   info_on_video: True

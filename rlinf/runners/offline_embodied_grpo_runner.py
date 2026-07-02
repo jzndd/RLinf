@@ -84,6 +84,7 @@ class OfflineEmbodiedGRPORunner:
 
         for step in range(start_step, self.max_steps):
             self.actor.set_global_step(self.global_step)
+            dataset_offline_eval_metrics = {}
 
             with self.timer("step"):
                 rollout_handle: Handle = self.actor.prepare_rollout_batch()
@@ -107,6 +108,11 @@ class OfflineEmbodiedGRPORunner:
                 )
                 if save_model:
                     self._save_checkpoint()
+                    if bool(self.cfg.data.get("if_offline_eval", False)):
+                        eval_handle: Handle = self.actor.run_dataset_offline_eval()
+                        dataset_offline_eval_metrics = (
+                            self._aggregate_numeric_metrics(eval_handle.wait())
+                        )
 
             time_metrics = self.timer.consume_durations()
             time_metrics["prepare_rollout"] = rollout_handle.consume_duration()
@@ -117,17 +123,24 @@ class OfflineEmbodiedGRPORunner:
             rollout_metrics = {f"rollout/{k}": v for k, v in rollout_metrics.items()}
             adv_metrics = {f"adv/{k}": v for k, v in adv_metrics.items()}
             training_metrics = {f"train/{k}": v for k, v in training_metrics.items()}
+            dataset_offline_eval_metrics = {
+                f"dataset_offline_eval/{k}": v
+                for k, v in dataset_offline_eval_metrics.items()
+            }
 
             self.metric_logger.log(time_metrics, step)
             self.metric_logger.log(rollout_metrics, step)
             self.metric_logger.log(adv_metrics, step)
             self.metric_logger.log(training_metrics, step)
+            if dataset_offline_eval_metrics:
+                self.metric_logger.log(dataset_offline_eval_metrics, step)
 
             logging_metrics = {}
             logging_metrics.update(time_metrics)
             logging_metrics.update(rollout_metrics)
             logging_metrics.update(adv_metrics)
             logging_metrics.update(training_metrics)
+            logging_metrics.update(dataset_offline_eval_metrics)
 
             global_pbar.set_postfix(logging_metrics, refresh=False)
             global_pbar.update(1)

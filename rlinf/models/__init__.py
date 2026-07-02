@@ -28,8 +28,6 @@ def get_model(cfg: DictConfig):
         from rlinf.models.embodiment.openpi import get_model
     elif model_type == SupportedModel.STARVLA:
         from rlinf.models.embodiment.starvla import get_model
-    elif model_type == SupportedModel.FASTWAM:
-        from rlinf.models.embodiment.fastwam import get_model
     elif model_type == SupportedModel.DEXBOTIC_PI:
         from rlinf.models.embodiment.dexbotic_pi import get_model
     elif model_type == SupportedModel.DREAMZERO:

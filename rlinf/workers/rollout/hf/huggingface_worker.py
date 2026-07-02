@@ -258,7 +258,6 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.OPENPI,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
-            SupportedModel.FASTWAM,
             SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
         ]:

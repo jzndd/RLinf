@@ -1,7 +1,7 @@
 defaults:
-  - env/libero_spatial@env.train
-  - env/libero_spatial@env.eval
-  - model/fastwam@actor.model
+  - env/libero_object@env.train
+  - env/libero_object@env.eval
+  - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - _self_
   - override hydra/job_logging: stdout
@@ -23,23 +23,21 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_offline_grpo_fastwam_noise_lora"
+    experiment_name: "libero_object_offline_grpo_openpi_pi05_flow_noise_subset1"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 4000
+  max_epochs: 10000
   max_steps: -1
-
   only_eval: False
   val_check_interval: -1
-  save_interval: 200
-
+  save_interval: 500
   resume_dir: null
   ckpt_path: null
 
 data:
-  train_data_paths: "/mnt/project_rlinf/jzn/workspace/openpi/data/libero_spatial_fullshot"
-  prompt_batch_size_per_gpu: 1
-  action_chunk: ${actor.model.num_action_chunks}
+  train_data_paths: "/mnt/project_rlinf/jzn/workspace/openpi/data/libero_object_fullshot"
+  prompt_batch_size_per_gpu: 16
+  action_chunk: ${actor.model.openpi.action_chunk}
   shuffle: True
   seed: 42
   num_workers: 4
@@ -50,13 +48,21 @@ data:
   task_index_key: "task_index"
   frame_index_key: "frame_index"
   max_cache_episodes: 4
+  use_continual_learning: True
+  continual_subset_id: 1
+  continual_initial_task_count: 6
+  new_task_traj: 10
+  old_task_traj: 5
+  continual_replay_seed: 0
+  if_offline_eval: True
+  eval_step: null
+  eval_batch_size: 32
 
 algorithm:
   normalize_advantages: True
-  group_size: 2
+  group_size: 8
   rollout_epoch: 1
   eval_rollout_epoch: 0
-
   reward_type: chunk_level
   offline_reward_fn: l1
   logprob_type: chunk_level
@@ -73,16 +79,15 @@ algorithm:
   huber_delta: 10.0
   gamma: 0.99
   gae_lambda: 0.95
-
   filter_rewards: False
-
   sampling_params:
     do_sample: True
     temperature_train: 1.0
-    temperature_eval: 1.0
+    temperature_eval: 0.6
     top_k: 50
     top_p: 1.0
     repetition_penalty: 1.0
+    add_BOS: False
 
 env:
   group_name: "EnvGroup"
@@ -94,7 +99,6 @@ rollout:
   unnorm_key: libero_10
   enable_offload: False
   pipeline_stage_num: 1
-
   model:
     model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
@@ -102,35 +106,33 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 1
-  global_batch_size: 4
+  micro_batch_size: 32
+  global_batch_size: 64
   seed: 42
   enable_offload: False
-
   model:
-    is_lora: true
-    num_inference_steps: 20
-    num_action_chunks: 10
-    action_horizon: 32
-    train_mot: false
-    train_action_expert: false
-    train_video_expert: false
-    train_proprio_encoder: false
-
+    model_path: "/mnt/project_rlinf/jzn/workspace/openpi/checkpoints/sft/pi05_libero_90_oneshot/libero_90_oneshot/30000"
+    num_steps: 4
+    num_action_chunks: 8
+    openpi:
+      joint_logprob: True
+      noise_method: "flow_noise"
   optim:
-    lr: 1.0e-5
+    lr: 5.0e-6
+    lr_scheduler: cosine
+    lr_warmup_steps: 500
+    total_training_steps: 10000
+    min_lr: 2.0e-6
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
     clip_grad: 1.0
     weight_decay: 0.01
-
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "full_shard"
+    sharding_strategy: "no_shard"
     gradient_checkpointing: False
-    use_orig_params: false
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
