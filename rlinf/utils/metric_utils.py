@@ -13,16 +13,146 @@
 # limitations under the License.
 
 import math
+import os
 import time
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import torch.distributed
 
-from rlinf.scheduler import Worker
+if TYPE_CHECKING:
+    from rlinf.data.embodied_io_struct import Trajectory
+
+
+def mean_bool_tensor_rate(
+    tensors: Sequence[torch.Tensor | None],
+    *,
+    sum_key: str,
+    count_key: str,
+    reducer: Callable[[dict[str, float]], dict[str, float]] | None = None,
+) -> float | None:
+    """Mean of flattened bool-like tensors, optionally reduced across ranks."""
+    shards = [
+        tensor.detach().reshape(-1).to(torch.float32)
+        for tensor in tensors
+        if isinstance(tensor, torch.Tensor) and tensor.numel() > 0
+    ]
+    if not shards:
+        return None
+
+    local_values = torch.cat(shards, dim=0)
+    reduced = {
+        sum_key: float(local_values.sum().item()),
+        count_key: float(local_values.numel()),
+    }
+    if reducer is not None:
+        reduced = reducer(reduced)
+    if reduced[count_key] <= 0:
+        return 0.0
+    return reduced[sum_key] / reduced[count_key]
+
+
+def mean_bool_tensor_rate_from_trajectories(
+    trajectories: Sequence["Trajectory"],
+    tensor_getter: Callable[["Trajectory"], torch.Tensor | None],
+    *,
+    sum_key: str,
+    count_key: str,
+    reducer: Callable[[dict[str, float]], dict[str, float]] | None = None,
+) -> float | None:
+    return mean_bool_tensor_rate(
+        [tensor_getter(trajectory) for trajectory in trajectories],
+        sum_key=sum_key,
+        count_key=count_key,
+        reducer=reducer,
+    )
+
+
+def trajectory_forward_input_tensor(
+    trajectory: "Trajectory", key: str
+) -> torch.Tensor | None:
+    forward_inputs = trajectory.forward_inputs
+    if not isinstance(forward_inputs, dict):
+        return None
+    value = forward_inputs.get(key)
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def trajectory_has_bool_tensor(tensor: torch.Tensor | None) -> bool:
+    return bool(
+        isinstance(tensor, torch.Tensor) and tensor.detach().to(torch.bool).any()
+    )
+
+
+def collect_trajectory_replay_metrics(
+    trajectories: Sequence["Trajectory"],
+    *,
+    reducer: Callable[[dict[str, float]], dict[str, float]] | None = None,
+) -> dict[str, float]:
+    """Replay-route diagnostics aggregated from received trajectories."""
+    metrics: dict[str, float] = {}
+    rate_specs = (
+        (
+            "replay/record_transition_rate",
+            lambda trajectory: trajectory_forward_input_tensor(
+                trajectory, "record_transition"
+            ),
+            "record_transition_sum",
+            "record_transition_count",
+        ),
+        (
+            "replay/actor_switch_rate",
+            lambda trajectory: trajectory_forward_input_tensor(
+                trajectory, "actor_switch"
+            ),
+            "actor_switch_sum",
+            "actor_switch_count",
+        ),
+        (
+            "replay/intervention_requested_rate",
+            lambda trajectory: trajectory_forward_input_tensor(
+                trajectory, "intervention_requested"
+            ),
+            "intervention_requested_sum",
+            "intervention_requested_count",
+        ),
+        (
+            "replay/intervention_rate",
+            lambda trajectory: trajectory.intervene_flags,
+            "intervention_sum",
+            "intervention_count",
+        ),
+    )
+    for metric_key, tensor_getter, sum_key, count_key in rate_specs:
+        rate = mean_bool_tensor_rate_from_trajectories(
+            trajectories,
+            tensor_getter,
+            sum_key=sum_key,
+            count_key=count_key,
+            reducer=reducer,
+        )
+        if rate is not None:
+            metrics[metric_key] = rate
+    return metrics
 
 
 def compute_split_num(num, split_num):
     return math.lcm(num, split_num) // split_num
+
+
+def _normalize_metric_shard(shard: object) -> torch.Tensor:
+    """One rank's metric -> 1D float tensor on CPU."""
+    if shard is None:
+        return torch.tensor([], dtype=torch.float32)
+    if isinstance(shard, torch.Tensor):
+        return shard.detach().cpu().reshape(-1).float()
+    if isinstance(shard, list):
+        if not shard:
+            return torch.tensor([], dtype=torch.float32)
+        return torch.cat([x.detach().cpu().reshape(-1).float() for x in shard], dim=0)
+    return torch.as_tensor(shard, dtype=torch.float32).cpu().reshape(-1)
 
 
 def count_trajectories(metrics_dict):
@@ -62,24 +192,36 @@ def compute_evaluate_metrics(eval_metrics_list):
     Returns:
         dict: Aggregated metrics with mean values and trajectory count
     """
+    if not eval_metrics_list:
+        return {}
+
     all_eval_metrics = {}
-    env_info_keys = eval_metrics_list[0].keys()
+    env_info_keys: set[str] = set()
+    for eval_metrics in eval_metrics_list:
+        env_info_keys.update(eval_metrics.keys())
 
     # Count trajectories from each process
-    # If num_trajectories is already in the metrics, use it; otherwise count from tensor shape
     trajectory_counts = []
     for eval_metrics in eval_metrics_list:
         count = count_trajectories(eval_metrics)
         trajectory_counts.append(count)
 
     for env_info_key in env_info_keys:
-        all_eval_metrics[env_info_key] = [
-            eval_metrics[env_info_key] for eval_metrics in eval_metrics_list
+        metric = [
+            eval_metrics[env_info_key]
+            for eval_metrics in eval_metrics_list
+            if env_info_key in eval_metrics
         ]
+        if metric:
+            all_eval_metrics[env_info_key] = metric
 
     for key in all_eval_metrics:
+        shards = [_normalize_metric_shard(s) for s in all_eval_metrics[key]]
+        stacked = torch.concat(shards).float()
         all_eval_metrics[key] = (
-            torch.concat(all_eval_metrics[key]).float().mean().numpy()
+            stacked.mean().detach().cpu().numpy()
+            if stacked.numel() > 0
+            else np.asarray(0.0, dtype=np.float64)
         )
 
     # Add total trajectory count to metrics
@@ -90,60 +232,83 @@ def compute_evaluate_metrics(eval_metrics_list):
 
 def compute_rollout_metrics(data_buffer: dict) -> dict:
     rollout_metrics = {}
+    loss_mask = data_buffer.get("loss_mask", None)
+
+    def reduce_metrics(values: torch.Tensor) -> tuple[float, float, float]:
+        from rlinf.scheduler.worker.worker import Worker
+
+        device = Worker.torch_platform.current_device()
+
+        if values.numel() == 0:
+            count = torch.tensor(0.0, device=device, dtype=torch.float32)
+            values_sum = torch.tensor(0.0, device=device, dtype=torch.float32)
+            min_value = float("inf")
+            max_value = float("-inf")
+        else:
+            values = values.to(device)
+            count = torch.tensor(
+                values.numel(), device=values.device, dtype=torch.float32
+            )
+            values_sum = values.to(dtype=torch.float32).sum()
+            max_value = torch.max(values).detach().item()
+            min_value = torch.min(values).detach().item()
+
+        reduce_sum_count = torch.stack([values_sum, count])
+        reduce_min_max = torch.as_tensor(
+            [-min_value, max_value],
+            device=device,
+            dtype=torch.float32,
+        )
+        torch.distributed.all_reduce(
+            reduce_sum_count, op=torch.distributed.ReduceOp.SUM
+        )
+        torch.distributed.all_reduce(reduce_min_max, op=torch.distributed.ReduceOp.MAX)
+        reduced_sum, reduced_count = reduce_sum_count.tolist()
+        reduced_min, reduced_max = reduce_min_max.tolist()
+
+        if reduced_count <= 0:
+            return float("nan"), float("nan"), float("nan")
+        return reduced_sum / reduced_count, -reduced_min, reduced_max
+
+    def valid_values(values: torch.Tensor) -> torch.Tensor:
+        if loss_mask is None:
+            return values.reshape(-1)
+        mask = loss_mask.to(device=values.device, dtype=torch.bool)
+        if mask.shape != values.shape:
+            mask = torch.broadcast_to(mask, values.shape)
+        return values[mask]
 
     if "rewards" in data_buffer:
-        rewards = data_buffer["rewards"].clone()
-        mean_rewards = torch.mean(rewards).to(Worker.torch_platform.current_device())
-        torch.distributed.all_reduce(mean_rewards, op=torch.distributed.ReduceOp.AVG)
+        rewards = data_buffer["rewards"]
+        rewards = valid_values(rewards)
+        mean_rewards, _, _ = reduce_metrics(rewards)
 
         rewards_metrics = {
-            "rewards": mean_rewards.item(),
+            "rewards": mean_rewards,
         }
         rollout_metrics.update(rewards_metrics)
 
     if "advantages" in data_buffer:
         advantages = data_buffer["advantages"]
-        mean_adv = torch.mean(advantages).to(Worker.torch_platform.current_device())
-        torch.distributed.all_reduce(mean_adv, op=torch.distributed.ReduceOp.AVG)
-        max_adv = torch.max(advantages).detach().item()
-        min_adv = torch.min(advantages).detach().item()
-        reduce_adv_tensor = torch.as_tensor(
-            [-min_adv, max_adv],
-            device=Worker.torch_platform.current_device(),
-            dtype=torch.float32,
-        )
-        torch.distributed.all_reduce(
-            reduce_adv_tensor, op=torch.distributed.ReduceOp.MAX
-        )
-        min_adv, max_adv = reduce_adv_tensor.tolist()
+        advantages = valid_values(advantages)
+        mean_adv, min_adv, max_adv = reduce_metrics(advantages)
 
         advantages_metrics = {
-            "advantages_mean": mean_adv.item(),
+            "advantages_mean": mean_adv,
             "advantages_max": max_adv,
-            "advantages_min": -min_adv,
+            "advantages_min": min_adv,
         }
         rollout_metrics.update(advantages_metrics)
 
     if data_buffer.get("returns", None) is not None:
         returns = data_buffer["returns"]
-        mean_ret = torch.mean(returns).to(Worker.torch_platform.current_device())
-        torch.distributed.all_reduce(mean_ret, op=torch.distributed.ReduceOp.AVG)
-        max_ret = torch.max(returns).detach().item()
-        min_ret = torch.min(returns).detach().item()
-        reduce_ret_tensor = torch.as_tensor(
-            [-min_ret, max_ret],
-            device=Worker.torch_platform.current_device(),
-            dtype=torch.float32,
-        )
-        torch.distributed.all_reduce(
-            reduce_ret_tensor, op=torch.distributed.ReduceOp.MAX
-        )
-        min_ret, max_ret = reduce_ret_tensor.tolist()
+        returns = valid_values(returns)
+        mean_ret, min_ret, max_ret = reduce_metrics(returns)
 
         returns_metrics = {
-            "returns_mean": mean_ret.item(),
+            "returns_mean": mean_ret,
             "returns_max": max_ret,
-            "returns_min": -min_ret,
+            "returns_min": min_ret,
         }
         rollout_metrics.update(returns_metrics)
 
@@ -182,9 +347,25 @@ def compute_loss_mask(dones):
 
 
 def print_metrics_table(
-    step: int, total_steps: int, start_time: float, metrics: dict, start_step: int = 0
+    step: int,
+    total_steps: int,
+    start_time: float,
+    metrics: dict,
+    start_step: int = 0,
+    log_path: str | None = None,
 ):
-    """Print training metrics in a simple, fast formatted table."""
+    """Print training metrics in a simple, fast formatted table.
+
+    The rendered table is written to stdout and, when ``log_path`` is given,
+    also appended to ``<log_path>/metrics.log``.
+    """
+    # Accumulate the table into lines so the exact same rendering goes to both
+    # stdout and the log file.
+    lines: list[str] = []
+
+    def emit(text: str = "") -> None:
+        lines.append(text)
+
     # Calculate progress info
     progress = (step + 1) / total_steps * 100
     elapsed_time = time.time() - start_time
@@ -228,9 +409,9 @@ def print_metrics_table(
         padding = total_width - 2 - len(title_text)
         left = padding // 2
         right = padding - left
-        print(f"├{'─' * left}{title_text}{'─' * right}┤")
+        emit(f"├{'─' * left}{title_text}{'─' * right}┤")
 
-    print(f"\n╭{'─' * (total_width - 2)}╮")
+    emit(f"\n╭{'─' * (total_width - 2)}╮")
     _print_section_title("Metric Table")
 
     # First line: Global Step and Progress
@@ -238,7 +419,7 @@ def print_metrics_table(
     progress_str = f"Progress: {bar} │ {progress:5.1f}%"
     line1 = f"│ {step_str} │ {progress_str}"
     line1 = _fit_line(line1, total_width - 2)
-    print(f"{line1} │")
+    emit(f"{line1} │")
 
     # Second line: Time information
     elapsed_str_formatted = f"Elapsed: {elapsed_str}"
@@ -246,7 +427,7 @@ def print_metrics_table(
     step_time_str = f"Step Time: {elapsed_time / steps_done:.3f}s"
     line2 = f"│ {elapsed_str_formatted} │ {eta_str_formatted} │ {step_time_str}"
     line2 = _fit_line(line2, total_width - 2)
-    print(f"{line2} │")
+    emit(f"{line2} │")
 
     # Group metrics by category
     categories = {
@@ -298,7 +479,7 @@ def print_metrics_table(
         if category_metrics:
             _print_section_title(category_name)
             # Blank line before metrics (except Global Step section, which is separate)
-            print(f"│{' ' * (table_width - 2)}│")
+            emit(f"│{' ' * (table_width - 2)}│")
 
             # Sort metrics for consistent output
             sorted_metrics = sorted(category_metrics.items())
@@ -337,12 +518,19 @@ def print_metrics_table(
                     f"│{_fit_cell(row_metrics[1], col_widths[1])}"
                     f"│{_fit_cell(row_metrics[2], col_widths[2])}│"
                 )
-                print(line)
+                emit(line)
 
             # Section separator (minimal)
-            print(f"│{' ' * (table_width - 2)}│")
+            emit(f"│{' ' * (table_width - 2)}│")
 
     # Bottom border
-    print(f"╰{'─' * (table_width - 2)}╯")
+    emit(f"╰{'─' * (table_width - 2)}╯")
 
-    print()
+    emit()
+
+    table = "\n".join(lines)
+    print(table)
+    if log_path:
+        os.makedirs(log_path, exist_ok=True)
+        with open(os.path.join(log_path, "metrics.log"), "a") as metrics_file:
+            metrics_file.write(table + "\n")

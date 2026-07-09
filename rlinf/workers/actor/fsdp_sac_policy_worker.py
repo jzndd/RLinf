@@ -43,6 +43,7 @@ from rlinf.utils.nested_dict_process import (
     put_tensor_device,
     split_dict_to_chunk,
 )
+from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
@@ -68,7 +69,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
             self.offload_optimizer()
-        self._setup_rollout_weight_dst_ranks()
         if self.cfg.actor.get("compile_model", False):
             self.model = torch.compile(
                 self.model, mode="default"
@@ -90,6 +90,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 target_module.gradient_checkpointing_enable()
         else:
             self.logger.info("[FSDP] Gradient checkpointing is disabled")
+
+        # Record the original trainable parameter names before FSDP wrapping.
+        # Persistent buffer names are also recorded for selective weight syncing.
+        self.param_names_need_sync = collect_param_names_need_sync(module)
 
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(
@@ -306,6 +310,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                         )
                         target_param.data.copy_(shadow.to(target_param.data.dtype))
 
+    @Worker.timer("actor/recv_traj")
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         """
         Receive rollout trajectories from rollout workers.
@@ -313,7 +318,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         Args:
             input_channel: The input channel to read from.
         """
-        send_num = self._component_placement.get_world_size("rollout") * self.stage_num
+        clear_memory(sync=False)
+
+        send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)
 
@@ -329,9 +336,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             intervene_traj_list = []
             for traj in recv_list:
                 assert isinstance(traj, Trajectory)
-                intervene_traj = traj.extract_intervene_traj()
-                if intervene_traj is not None:
-                    intervene_traj_list.append(intervene_traj)
+                intervene_trajs = traj.extract_intervene_traj()
+                if intervene_trajs is not None:
+                    intervene_traj_list.extend(intervene_trajs)
 
             if len(intervene_traj_list) > 0:
                 self.demo_buffer.add_trajectories(intervene_traj_list)
@@ -364,7 +371,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 SupportedModel.OPENVLA_OFT,
             ]:
                 kwargs["temperature"] = (
-                    self.cfg.algorithm.sampling_params.temperature_train
+                    self.cfg.rollout.sampling_params.temperature_train
                 )
             if use_dsrl:
                 kwargs["train"] = True
@@ -476,7 +483,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         curr_obs = batch["curr_obs"]
         kwargs = {}
         if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:
-            kwargs["temperature"] = self.cfg.algorithm.sampling_params.temperature_train
+            kwargs["temperature"] = self.cfg.rollout.sampling_params.temperature_train
         if self.use_dsrl:
             kwargs["train"] = True
         pi, log_pi, shared_feature = self.model(
@@ -526,7 +533,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             kwargs = {}
             if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:
                 kwargs["temperature"] = (
-                    self.cfg.algorithm.sampling_params.temperature_train
+                    self.cfg.rollout.sampling_params.temperature_train
                 )
             if self.use_dsrl:
                 kwargs["train"] = True
@@ -739,6 +746,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         torch.cuda.empty_cache()
         return mean_metric_dict
 
+    @Worker.timer("actor/compute_adv")
     def compute_advantages_and_returns(self):
         """
         SAC doesn't compute advantages/returns like PPO.

@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import atexit
+import copy
+import json
 import os
 import pickle
-import signal
+import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from typing import Any, Optional
@@ -24,9 +28,47 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from rlinf.data.lerobot_writer import LeRobotDatasetWriter
+from rlinf.utils.logging import get_logger
 
 _VALID_FORMATS = ("pickle", "lerobot")
+
+
+_ID_DIR_RE = re.compile(r"^id_(\d+)$")
+
+
+def _scan_existing_lerobot_shards(save_dir: str, rank: int) -> tuple[int, int]:
+    """Return ``(total_episodes, next_shard_id)`` for resume.
+
+    ``next_shard_id`` is ``max(existing_id_numbers) + 1`` over every
+    ``id_<int>/`` directory (regardless of whether ``meta/info.json`` is
+    finalized) so a crashed session's partial shard is never overwritten.
+    Shards with unparseable ``info.json`` contribute 0 to ``total_episodes``.
+    """
+    rank_dir = os.path.join(save_dir, f"rank_{rank}")
+    if not os.path.isdir(rank_dir):
+        return 0, 0
+
+    total = 0
+    max_id = -1
+    for entry in os.listdir(rank_dir):
+        m = _ID_DIR_RE.match(entry)
+        if m is None:
+            continue
+        if not os.path.isdir(os.path.join(rank_dir, entry)):
+            continue
+        max_id = max(max_id, int(m.group(1)))
+
+        info_path = os.path.join(rank_dir, entry, "meta", "info.json")
+        try:
+            with open(info_path) as f:
+                meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        count = meta.get("total_episodes")
+        if isinstance(count, int) and count > 0:
+            total += count
+    next_shard_id = max_id + 1 if max_id >= 0 else 0
+    return total, next_shard_id
 
 
 class CollectEpisode(gym.Wrapper):
@@ -53,11 +95,14 @@ class CollectEpisode(gym.Wrapper):
         robot_type: Robot type for LeRobot metadata. Defaults to ``"panda"``.
         fps: FPS for LeRobot metadata. Defaults to 10.
         only_success: Whether to save only successful episodes. Defaults to False.
-        stats_sample_ratio: Sampling ratio for incremental image statistics
-            (lerobot only). Defaults to 0.1.
         finalize_interval: Call ``writer.finalize()`` every this many completed
             episodes to flush ``info.json`` and ``stats.json`` as a checkpoint.
             ``0`` disables periodic flushing (lerobot only). Defaults to 100.
+        resume: If True and ``export_format == "lerobot"``, reuse ``save_dir``
+            across sessions — new episodes land in a fresh ``id_{N}`` shard
+            (N = sum of episodes across pre-existing shards) so the in-progress
+            write never touches previously-finalized data. Ignored for pickle.
+            Defaults to False.
     """
 
     def __init__(
@@ -71,8 +116,8 @@ class CollectEpisode(gym.Wrapper):
         robot_type: str = "panda",
         fps: int = 10,
         only_success: bool = False,
-        stats_sample_ratio: float = 0.1,
         finalize_interval: int = 100,
+        resume: bool = False,
     ):
         if isinstance(env, gym.Env):
             super().__init__(env)
@@ -93,13 +138,21 @@ class CollectEpisode(gym.Wrapper):
         self.robot_type = robot_type
         self.fps = fps
         self.only_success = only_success
-        self.stats_sample_ratio = stats_sample_ratio
         self.finalize_interval = finalize_interval
 
-        # LeRobot writer is created lazily on the first completed episode.
-        self._lerobot_writer: Optional[LeRobotDatasetWriter] = None
-        self._lerobot_lock = Lock()
-        self._episodes_written = 0  # guarded by _lerobot_lock
+        self._preexisting_episode_count = 0
+        self._next_shard_id = 0
+        if export_format == "lerobot":
+            self._lerobot_writer: Optional[Any] = None
+            self._lerobot_lock = Lock()
+            if resume:
+                (
+                    self._preexisting_episode_count,
+                    self._next_shard_id,
+                ) = _scan_existing_lerobot_shards(save_dir, rank)
+            self._episodes_written = (
+                self._preexisting_episode_count
+            )  # guarded by _lerobot_lock
 
         # Single-worker executor keeps write ordering deterministic.
         self._executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
@@ -111,19 +164,33 @@ class CollectEpisode(gym.Wrapper):
         # Per-environment episode state.
         self._episode_ids = [0] * num_envs
         self._episode_success = [False] * num_envs
+        self._segment_ids: list[int] = [0] * num_envs
+        self._global_step = 0
         # Holds the post-reset obs for auto-reset envs to prepend to next episode.
         self._pending_obs: list[Any] = [None] * num_envs
+        self._pending_info: list[Any] = [None] * num_envs
         self._buffers: list[dict[str, list]] = [
             self._new_buffer() for _ in range(num_envs)
         ]
 
         self._closed = False
+        self.logger = get_logger()
 
         os.makedirs(self.save_dir, exist_ok=True)
         atexit.register(self._finalize_on_exit)
-        signal.signal(signal.SIGTERM, self._handle_signal)
 
-    # ─────────────────────────────────────────── gymnasium interface ──────────
+    @property
+    def preexisting_episode_count(self) -> int:
+        """Number of episodes on disk at construction time (resume mode only)."""
+        return self._preexisting_episode_count
+
+    @property
+    def is_start(self):
+        return getattr(self.env, "is_start")
+
+    @is_start.setter
+    def is_start(self, value):
+        setattr(self.env, "is_start", value)
 
     def reset(
         self,
@@ -143,6 +210,7 @@ class CollectEpisode(gym.Wrapper):
         self._buffers = [self._new_buffer() for _ in range(self.num_envs)]
         self._episode_success = [False] * self.num_envs
         self._pending_obs = [None] * self.num_envs
+        self._pending_info = [None] * self.num_envs
 
         try:
             obs, info = self.env.reset(seed=seed, options=options)
@@ -210,7 +278,7 @@ class CollectEpisode(gym.Wrapper):
                 else truncations
             )
             step_info = (
-                infos_list[step_idx]
+                copy.deepcopy(infos_list[step_idx])
                 if isinstance(infos_list, (list, tuple))
                 else infos_list
             )
@@ -234,8 +302,6 @@ class CollectEpisode(gym.Wrapper):
             return self.env.close()
         return None
 
-    # ─────────────────────────────────────────── buffer management ────────────
-
     def _new_buffer(self) -> dict[str, list]:
         return {
             "observations": [],
@@ -244,25 +310,84 @@ class CollectEpisode(gym.Wrapper):
             "terminated": [],
             "truncated": [],
             "infos": [],
+            "segment_ids": [],
         }
+
+    def _seed_reset_frame(self, env_idx: int, env_obs: Any) -> None:
+        """Seed a fresh buffer with the post-reset state-aligned entry.
+
+        State-aligned fields (observations / rewards / terminated / truncated /
+        infos) get a leading reset entry; action-aligned fields (actions,
+        segment_ids) stay empty and fill on the first regular step.
+        """
+        buf = self._buffers[env_idx]
+        buf["observations"].append(env_obs)
+        buf["rewards"].append(0.0)
+        buf["terminated"].append(False)
+        buf["truncated"].append(False)
+        buf["infos"].append({})
 
     def _record_reset_obs(self, obs) -> None:
         """Record the initial observation from reset into every env's buffer."""
         for env_idx in range(self.num_envs):
-            self._buffers[env_idx]["observations"].append(
-                self._slice_copy(obs, env_idx)
-            )
+            self._seed_reset_frame(env_idx, self._slice_copy(obs, env_idx))
+
+    @staticmethod
+    def _bool_from_env_info(env_info: Any, key: str) -> bool:
+        """Read a per-env bool flag (scalar / 0-d / size-1 array all OK)."""
+        if not isinstance(env_info, dict) or env_info.get(key) is None:
+            return False
+        return bool(np.asarray(env_info[key]).any())
 
     def _record_step(self, action, obs, reward, terminated, truncated, info) -> None:
         """Record one transition into every env's buffer."""
+        self._global_step += 1
+
+        has_final_obs = isinstance(info, dict) and "final_observation" in info
+        if has_final_obs:
+            final_observation = info["final_observation"]
+            final_info_batch = info["final_info"]
+            info_no_reset = copy.deepcopy(info)
+            info_no_reset.pop("final_observation")
+            info_no_reset.pop("final_info")
+
         for env_idx in range(self.num_envs):
             # Auto-reset envs store the pre-reset obs in info["final_observation"];
             # the current `obs` is the post-reset obs for the *next* episode.
-            if isinstance(info, dict) and "final_observation" in info:
-                env_obs = self._slice_copy(info["final_observation"], env_idx)
+            # Only use final_observation for envs that are actually done this step.
+            env_done = self._scalar_flag(terminated, env_idx) or self._scalar_flag(
+                truncated, env_idx
+            )
+            if has_final_obs and env_done:
+                env_obs = self._slice_copy(final_observation, env_idx)
+                env_info = self._slice_copy(final_info_batch, env_idx)
                 self._pending_obs[env_idx] = self._slice_copy(obs, env_idx)
+                self._pending_info[env_idx] = self._slice_copy(info_no_reset, env_idx)
+                if "intervene_action" in env_info:
+                    env_info["intervene_action"] = env_info["intervene_action"][-1]
+                    env_info["intervene_flag"] = env_info["intervene_flag"][-1]
             else:
                 env_obs = self._slice_copy(obs, env_idx)
+                env_info = self._slice_copy(info, env_idx)
+                if "final_observation" in env_info:
+                    env_info.pop("final_observation")
+                    env_info.pop("final_info")
+
+            record_reset = self._bool_from_env_info(env_info, "record_reset")
+            pre_record = self._bool_from_env_info(env_info, "pre_record")
+
+            if record_reset:
+                self._buffers[env_idx] = self._new_buffer()
+                self._episode_success[env_idx] = False
+                self._segment_ids[env_idx] = 0
+                self._seed_reset_frame(env_idx, env_obs)
+                continue
+
+            if pre_record:
+                continue
+
+            if self._bool_from_env_info(env_info, "segment_advance"):
+                self._segment_ids[env_idx] += 1
 
             buf = self._buffers[env_idx]
             buf["observations"].append(env_obs)
@@ -270,36 +395,53 @@ class CollectEpisode(gym.Wrapper):
             buf["rewards"].append(self._slice_copy(reward, env_idx))
             buf["terminated"].append(self._slice_copy(terminated, env_idx))
             buf["truncated"].append(self._slice_copy(truncated, env_idx))
-            buf["infos"].append(self._slice_copy(info, env_idx))
+            buf["infos"].append(env_info)
+            buf["segment_ids"].append(int(self._segment_ids[env_idx]))
 
-            # Update per-env success using already-sliced info (no extra copy).
-            self._update_success(env_idx, self._slice_data(info, env_idx))
+            self._update_success(env_idx, self._slice_data(env_info, env_idx))
 
     def _reset_env_buffer(self, env_idx: int) -> None:
         """Advance episode counter, clear the buffer, and carry over pending obs."""
         self._episode_ids[env_idx] += 1
         self._buffers[env_idx] = self._new_buffer()
         self._episode_success[env_idx] = False
+        self._segment_ids[env_idx] = 0
 
         if self._pending_obs[env_idx] is not None:
             self._buffers[env_idx]["observations"].append(self._pending_obs[env_idx])
             self._pending_obs[env_idx] = None
 
-    # ─────────────────────────────────────────── episode flushing ─────────────
+            if self._pending_info[env_idx] is not None:
+                self._buffers[env_idx]["infos"].append(self._pending_info[env_idx])
+                self._pending_info[env_idx] = None
+            else:
+                self._buffers[env_idx]["infos"].append({})
+
+            self._buffers[env_idx]["rewards"].append(0.0)
+            self._buffers[env_idx]["terminated"].append(False)
+            self._buffers[env_idx]["truncated"].append(False)
 
     def _maybe_flush(self, terminated, truncated) -> None:
         """Save finished episodes and reset their buffers."""
         for env_idx in range(self.num_envs):
-            if self._scalar_flag(terminated, env_idx) or self._scalar_flag(
-                truncated, env_idx
-            ):
-                is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
-                if not self.only_success or is_success:
+            is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
+            done_by_term = self._scalar_flag(terminated, env_idx)
+            done_by_trunc = self._scalar_flag(truncated, env_idx)
+            if self.only_success:
+                if is_success and done_by_term:
                     self._flush_episode(env_idx, is_success)
-                self._reset_env_buffer(env_idx)
+                    self._reset_env_buffer(env_idx)
+                else:
+                    if done_by_trunc:
+                        self._reset_env_buffer(env_idx)
+            else:
+                if done_by_term or done_by_trunc:
+                    self._flush_episode(env_idx, is_success)
+                    self._reset_env_buffer(env_idx)
 
     def _flush_episode(self, env_idx: int, is_success: bool) -> None:
         """Dispatch a completed episode to the appropriate format writer."""
+        self.logger.info(f"Flush env {env_idx}")
         buf = self._buffers[env_idx]
         if not buf["actions"]:
             return
@@ -314,6 +456,7 @@ class CollectEpisode(gym.Wrapper):
                     "rank": self.rank,
                     "env_idx": env_idx,
                     "episode_id": self._episode_ids[env_idx],
+                    "step": self._global_step,
                     "success": is_success,
                     "observations": buf["observations"],
                     "actions": buf["actions"],
@@ -326,113 +469,160 @@ class CollectEpisode(gym.Wrapper):
             label = "success" if is_success else "fail"
             filename = (
                 f"rank_{self.rank}_env_{env_idx}_"
-                f"episode_{self._episode_ids[env_idx]}_{label}.pkl"
+                f"episode_{self._episode_ids[env_idx]}_"
+                f"step_{self._global_step}_"
+                f"{label}.pkl"
             )
             self._submit(
                 self._write_pickle, os.path.join(self.save_dir, filename), episode_data
             )
 
-    # ─────────────────────────────────────────── lerobot helpers ──────────────
-
     def _buffer_to_lerobot_ep(
         self, buf: dict, env_idx: int, is_success: bool
-    ) -> Optional[dict[str, Any]]:
-        """Convert a raw episode buffer into a LeRobot-compatible episode dict.
-
+    ) -> Optional[list[dict[str, Any]]]:
+        """Convert a raw episode buffer into a list of per-step frame dicts.
+        Produces the format expected by ``LeRobotDatasetWriter.add_episode``:
+        a ``list[dict]`` where every dict represents one step and carries the
+        fields ``image``, ``state``, ``actions``, ``task``, ``is_success``,
+        ``done``, ``intervene_flag``, and optionally ``wrist_image`` /
+        ``extra_view_image``.
         The observations list contains one extra entry prepended at reset time,
-        so it is aligned to the actions list by taking the trailing N entries.
+        so it is aligned to the actions list by taking the leading N entries.
         Steps where any required field (image, state, action) is missing are
         silently skipped.
+        Args:
+            buf: Raw episode buffer produced by ``_new_buffer``.
+            env_idx: Index of the parallel environment this buffer belongs to.
+            is_success: Whether the episode was successful.
+        Returns:
+            A list of per-step frame dicts, or ``None`` if no valid frames
+            could be extracted.
         """
         actions = buf["actions"]
         terminated = buf["terminated"]
         obs_steps = buf["observations"]
-
+        seg_ids = buf.get("segment_ids", [])
         if not actions:
             return None
-
         if len(obs_steps) > len(actions):
             obs_steps = obs_steps[: len(actions)]
-
         task_desc = self._extract_task_description(buf, env_idx)
-        images: list[np.ndarray] = []
-        wrist_images: list[np.ndarray] = []
-        states: list[np.ndarray] = []
-        np_actions: list[np.ndarray] = []
-        dones: list[bool] = []
+        steps: list[dict[str, Any]] = []
         first_term_step: Optional[int] = None
-
         for i, action in enumerate(actions):
             obs = obs_steps[i] if i < len(obs_steps) else None
-            image, wrist_image, state = self._extract_obs_image_state(obs)
+            image, wrist_image, extra_view_image, state = self._extract_obs_image_state(
+                obs
+            )
+            # Overwrite action with intervene action if present.
             np_action = self._to_numpy(action)
-
-            if image is None or state is None or np_action is None:
+            raw_info = buf["infos"][i + 1]
+            if isinstance(raw_info, dict) and "final_info" in raw_info:
+                # _record_step normally pops final_info before storing; if it
+                # leaked through (e.g. nested wrapper that also auto-resets)
+                # drop the frame instead of crashing the writer.
+                self.logger.warning(
+                    "collect_episode: dropping frame %d because info still "
+                    "carries final_info; check upstream auto-reset wrappers",
+                    i,
+                )
                 continue
+            info_with_intervene = copy.deepcopy(raw_info)
 
-            images.append(self._to_uint8(np.asarray(image)))
-            if wrist_image is not None:
-                wrist_images.append(self._to_uint8(np.asarray(wrist_image)))
-            states.append(np.asarray(state).astype(np.float32))
-            np_actions.append(np.asarray(np_action).astype(np.float32))
-            dones.append(False)
-
+            if (
+                "intervene_flag" in info_with_intervene
+                and "intervene_action" in info_with_intervene
+            ):
+                if info_with_intervene["intervene_flag"].all():
+                    np_action = self._to_numpy(info_with_intervene["intervene_action"])
+            if state is None or np_action is None:
+                continue
+            intervene_flag = self._intervene_flag_from_info(info_with_intervene)
+            seg_id = int(seg_ids[i]) if i < len(seg_ids) else 0
+            frame: dict[str, Any] = {
+                "state": np.asarray(state).astype(np.float32),
+                "actions": np.asarray(np_action).astype(np.float32).flatten(),
+                "task": task_desc,
+                "is_success": np.array([is_success], dtype=bool),
+                "done": np.array([False], dtype=bool),
+                "intervene_flag": np.array([intervene_flag], dtype=bool),
+                "segment_id": np.array([seg_id], dtype=np.uint8),
+            }
+            if image is not None:
+                frame["image"] = self._to_uint8(np.asarray(image))
+            for key, img in self._expand_multi_view_images(
+                "wrist_image", wrist_image
+            ).items():
+                frame[key] = self._to_uint8(np.asarray(img))
+            for key, img in self._expand_multi_view_images(
+                "extra_view_image", extra_view_image
+            ).items():
+                frame[key] = self._to_uint8(np.asarray(img))
+            steps.append(frame)
             if bool(terminated[i]) and first_term_step is None:
-                first_term_step = len(np_actions)
-
-        if not images:
+                first_term_step = len(steps)
+        if not steps:
             return None
+        end = first_term_step if first_term_step is not None else len(steps)
+        steps = steps[:end]
+        steps[-1]["done"] = np.array([True], dtype=bool)
+        return steps
 
-        end = first_term_step if first_term_step is not None else len(images)
-        dones_out = dones[:end]
-        if dones_out:
-            dones_out[-1] = True
+    def _ensure_lerobot_writer(self, ep_data: dict):
+        """Get-or-create the LeRobot writer. Must be called under ``_lerobot_lock``."""
+        from rlinf.data.lerobot_writer import LeRobotDatasetWriter
 
-        return {
-            "images": images[:end],
-            "wrist_images": wrist_images[:end] if wrist_images else None,
-            "states": states[:end],
-            "actions": np_actions[:end],
-            "dones": dones_out,
-            "task": task_desc,
-            "is_success": is_success,
-        }
-
-    def _ensure_lerobot_writer(self, ep_data: dict) -> LeRobotDatasetWriter:
-        """Create the LeRobot writer on first use. Must be called inside the lock."""
         if self._lerobot_writer is None:
-            self._lerobot_writer = LeRobotDatasetWriter(
-                root_dir=self.save_dir,
+            self._lerobot_writer = LeRobotDatasetWriter()
+        shard_id = self._next_shard_id
+
+        if self._lerobot_writer.dataset is None:
+            first = ep_data[0]
+            wrist_image_keys = self._collect_image_keys(first, "wrist_image")
+            extra_view_image_keys = self._collect_image_keys(first, "extra_view_image")
+            self._lerobot_writer.create(
+                repo_id=os.path.join(
+                    self.save_dir, f"rank_{self.rank}", f"id_{shard_id}"
+                ),
                 robot_type=self.robot_type,
                 fps=self.fps,
-                image_shape=ep_data["images"][0].shape,
-                state_dim=ep_data["states"][0].shape[-1],
-                action_dim=ep_data["actions"][0].shape[-1],
-                use_incremental_stats=True,
-                stats_sample_ratio=self.stats_sample_ratio,
+                image_shape=first["image"].shape if "image" in first else None,
+                state_dim=int(first["state"].shape[-1]),
+                action_dim=int(first["actions"].shape[-1]),
+                has_image="image" in first,
+                wrist_image_keys=wrist_image_keys,
+                extra_view_image_keys=extra_view_image_keys,
+                has_intervene_flag="intervene_flag" in first,
+                has_segment_id="segment_id" in first,
             )
+            self._next_shard_id = shard_id + 1
         return self._lerobot_writer
+
+    @staticmethod
+    def _collect_image_keys(
+        frame: dict[str, Any],
+        prefix: str,
+    ) -> dict[str, tuple[int, ...]]:
+        """Return ``{key: (H, W, C)}`` for all frame keys matching *prefix*.
+
+        Matches both the bare ``prefix`` (e.g. ``wrist_image``) and indexed
+        variants (``wrist_image/0``, ``wrist_image/1``, …).
+        """
+        return {
+            k: tuple(frame[k].shape)
+            for k in frame
+            if (k == prefix or k.startswith(f"{prefix}-"))
+            and isinstance(frame[k], np.ndarray)
+            and frame[k].ndim == 3
+        }
 
     def _write_lerobot_episode(self, ep_data: dict) -> None:
         with self._lerobot_lock:
             writer = self._ensure_lerobot_writer(ep_data)
-            wrist_images = ep_data["wrist_images"]
-            writer.add_episode(
-                images=np.stack(ep_data["images"]),
-                wrist_images=np.stack(wrist_images)
-                if wrist_images is not None
-                else None,
-                states=np.stack(ep_data["states"]),
-                actions=np.stack(ep_data["actions"]),
-                task=ep_data["task"],
-                is_success=ep_data["is_success"],
-                dones=np.array(ep_data["dones"], dtype=bool),
-            )
+            writer.add_episode(ep_data)
             self._episodes_written += 1
-            if (
-                self.finalize_interval > 0
-                and self._episodes_written % self.finalize_interval == 0
-            ):
+            count = self._episodes_written
+            if self.finalize_interval > 0 and count % self.finalize_interval == 0:
                 writer.finalize()
 
     def _finalize_lerobot(self) -> None:
@@ -445,18 +635,15 @@ class CollectEpisode(gym.Wrapper):
                 self._lerobot_writer.finalize()
                 self._lerobot_writer = None
 
-    # ─────────────────────────────────────────── pickle helpers ───────────────
-
     def _write_pickle(self, save_path: str, episode_data: dict) -> None:
         with open(save_path, "wb") as f:
             pickle.dump(episode_data, f)
-
-    # ─────────────────────────────────────────── async I/O ────────────────────
 
     def _submit(self, fn, *args) -> None:
         if self._executor is None:
             return
         self._futures.append(self._executor.submit(fn, *args))
+        self.logger.info(f"Futures queue length: {len(self._futures)}")
         self._drain_futures()
 
     def _drain_futures(self) -> None:
@@ -473,30 +660,18 @@ class CollectEpisode(gym.Wrapper):
             f.result()
         self._futures = []
 
-    def _handle_signal(self, signum, frame) -> None:
-        self.close()
-        raise SystemExit(0)
-
     def _finalize_on_exit(self) -> None:
         self.close()
-
-    # ─────────────────────────────────────────── success tracking ─────────────
 
     def _update_success(self, env_idx: int, env_info) -> None:
         """Update the per-env success flag from a single-env info dict."""
         if not isinstance(env_info, dict):
             return
 
-        ep = env_info.get("episode") or {}
-        success = ep.get("success_once") if isinstance(ep, dict) else None
-        if success is None and isinstance(ep, dict):
-            success = ep.get("success_at_end")
-        if success is None:
-            success = env_info.get("success")
-
+        success = self._extract_success_from_info(env_info)
         if success is not None:
-            val = success.item() if isinstance(success, torch.Tensor) else success
-            self._episode_success[env_idx] = bool(val)
+            # Keep success sticky during an episode.
+            self._episode_success[env_idx] = self._episode_success[env_idx] or success
 
     def _get_episode_success(self, buf: dict, env_idx: int) -> bool:
         """Determine final episode success by scanning recorded info dicts.
@@ -506,21 +681,83 @@ class CollectEpisode(gym.Wrapper):
         ``success`` keys. Falls back to the incrementally-updated
         ``_episode_success`` flag.
         """
-        for info in reversed(buf["infos"]):
+        if self._episode_success[env_idx]:
+            return True
+
+        found_any = False
+        is_success = False
+
+        for info in buf["infos"]:
             if not isinstance(info, dict):
                 continue
-            for src in (info.get("final_info"), info.get("episode"), info):
-                if not isinstance(src, dict):
-                    continue
-                for key in ("success_once", "success_at_end", "success"):
-                    val = src.get(key)
-                    if val is not None:
-                        return bool(
-                            val.item() if isinstance(val, torch.Tensor) else val
-                        )
+            success = self._extract_success_from_info(info)
+            if success is not None:
+                found_any = True
+                is_success = is_success or success
+
+        if found_any:
+            return is_success
         return self._episode_success[env_idx]
 
-    # ─────────────────────────────────────────── data utilities ───────────────
+    @staticmethod
+    def _intervene_flag_from_info(info: Any) -> bool:
+        """Whether this timestep used human / expert intervention (per-env info)."""
+        if not isinstance(info, dict):
+            return False
+        val = info.get("intervene_flag")
+        if val is None:
+            return False
+        arr = CollectEpisode._to_numpy(val)
+        if arr is None:
+            return False
+        return bool(np.asarray(arr, dtype=bool).reshape(-1).any())
+
+    @staticmethod
+    def _to_bool_scalar(val) -> Optional[bool]:
+        if val is None:
+            return None
+        if isinstance(val, torch.Tensor):
+            if val.numel() != 1:
+                return None
+            return bool(val.item())
+        if isinstance(val, np.ndarray):
+            if val.size != 1:
+                return None
+            return bool(val.reshape(-1)[0])
+        return bool(val)
+
+    def _extract_success_from_source(self, src) -> Optional[bool]:
+        if not isinstance(src, dict):
+            return None
+        for key in ("success_once", "success_at_end", "success"):
+            val = self._to_bool_scalar(src.get(key))
+            if val is not None:
+                return val
+        return None
+
+    def _extract_success_from_info(self, info: dict) -> Optional[bool]:
+        """Extract success with episode-level fields taking priority."""
+        episode_values: list[bool] = []
+
+        final_info = info.get("final_info", None)
+        if isinstance(final_info, dict):
+            final_info_success = self._extract_success_from_source(final_info)
+            if final_info_success is not None:
+                episode_values.append(final_info_success)
+            final_episode_success = self._extract_success_from_source(
+                final_info.get("episode")
+            )
+            if final_episode_success is not None:
+                episode_values.append(final_episode_success)
+
+        current_episode_success = self._extract_success_from_source(info.get("episode"))
+        if current_episode_success is not None:
+            episode_values.append(current_episode_success)
+
+        if episode_values:
+            return any(episode_values)
+
+        return self._extract_success_from_source(info)
 
     def _extract_task_description(self, buf: dict, env_idx: int) -> str:
         for obs in reversed(buf["observations"]):
@@ -533,13 +770,46 @@ class CollectEpisode(gym.Wrapper):
         return "unknown task"
 
     def _extract_obs_image_state(self, obs):
-        """Return ``(image, wrist_image, state)`` numpy arrays from an obs dict."""
+        """Return ``(image, wrist_image, extra_view_image, state)`` from an obs dict.
+
+        ``wrist_image`` and ``extra_view_image`` are returned as raw numpy
+        arrays and may have shape ``[H, W, C]`` *or* ``[N, H, W, C]``.
+        Use :meth:`_expand_multi_view_images` to fan them out into
+        individually-keyed views before writing.
+        """
         if not isinstance(obs, dict):
-            return None, None, None
+            return None, None, None, None
         image = obs.get("main_images", obs.get("image", obs.get("full_image")))
         wrist_image = obs.get("wrist_images", obs.get("wrist_image"))
+        extra_view_image = obs.get("extra_view_images", obs.get("extra_view_image"))
         state = obs.get("states", obs.get("state"))
-        return self._to_numpy(image), self._to_numpy(wrist_image), self._to_numpy(state)
+        return (
+            self._to_numpy(image),
+            self._to_numpy(wrist_image),
+            self._to_numpy(extra_view_image),
+            self._to_numpy(state),
+        )
+
+    @staticmethod
+    def _expand_multi_view_images(
+        base_key: str,
+        arr: Optional[np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        """Expand a potentially batched image array into per-view entries.
+
+        * ``[H, W, C]``           → ``{base_key: img}``
+        * ``[1, H, W, C]``        → ``{base_key: img[0]}``
+        * ``[N, H, W, C]`` (N>1)  → ``{base_key-0: img[0], …, base_key-N-1: img[N-1]}``
+        """
+        if arr is None:
+            return {}
+        if arr.ndim == 3:
+            return {base_key: arr}
+        if arr.ndim == 4:
+            if arr.shape[0] == 1:
+                return {base_key: arr[0]}
+            return {f"{base_key}-{i}": arr[i] for i in range(arr.shape[0])}
+        return {base_key: arr}
 
     def _slice_data(self, data, env_idx: int):
         """Slice batched data for a single env without copying."""
@@ -610,8 +880,6 @@ class CollectEpisode(gym.Wrapper):
             return tuple(self._copy(item) for item in data)
         return data
 
-    # ─────────────────────────────────────── goal site visualization ──────────
-
     def _show_goal_site_visual(self) -> None:
         """Unhide the goal site in environments that support it."""
         if not self.show_goal_site:
@@ -632,3 +900,7 @@ class CollectEpisode(gym.Wrapper):
                 unwrapped._hidden_objects.remove(goal_site)
         if hasattr(goal_site, "show_visual"):
             goal_site.show_visual()
+
+    def update_reset_state_ids(self):
+        if hasattr(self.env, "update_reset_state_ids"):
+            self.env.update_reset_state_ids()

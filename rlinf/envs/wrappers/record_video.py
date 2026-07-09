@@ -84,6 +84,14 @@ class RecordVideo(gym.Wrapper):
         else:
             self._fps = self._get_fps_from_env(env)
 
+    @property
+    def is_start(self):
+        return getattr(self.env, "is_start")
+
+    @is_start.setter
+    def is_start(self, value):
+        setattr(self.env, "is_start", value)
+
     def _get_fps_from_env(self, env: gym.Env) -> int:
         """Resolve FPS from config/env metadata with fallback."""
         if hasattr(self.video_cfg, "fps") and self.video_cfg.fps is not None:
@@ -107,6 +115,8 @@ class RecordVideo(gym.Wrapper):
 
     def _get_image_from_dict(self, obs: dict) -> Optional[Any]:
         """Pick the best image field from an observation dict."""
+        if hasattr(self.env, "capture_image"):
+            return self.env.capture_image()
         for key in ("main_images", "images", "rgb", "full_image", "main_image"):
             if key in obs and obs[key] is not None:
                 return obs[key]
@@ -363,11 +373,34 @@ class RecordVideo(gym.Wrapper):
         self.add_new_frames(obs, info, reward, terminations)
         return obs, reward, terminated, truncated, info
 
-    def chunk_step(self, *args, **kwargs):
-        """Step a chunk and record all frames from the chunk."""
-        result = self.env.chunk_step(*args, **kwargs)
+    def record_video_in_result(self, result) -> None:
+        """Record video frames from a chunk_step / async_chunk_step result tuple."""
         if isinstance(result, tuple) and len(result) >= 5:
             obs_list, rewards, terminations, _truncations, infos_list = result[:5]
+
+            # Some envs may skip intermediate observations for performance and return
+            # None entries. Filter them out for video collection.
+            if isinstance(obs_list, (list, tuple)):
+                valid_indices = [i for i, obs in enumerate(obs_list) if obs is not None]
+                if len(valid_indices) == 0:
+                    return
+                if len(valid_indices) != len(obs_list):
+                    obs_list = [obs_list[i] for i in valid_indices]
+                    if isinstance(infos_list, (list, tuple)):
+                        infos_list = [infos_list[i] for i in valid_indices]
+                    if (
+                        torch is not None
+                        and isinstance(rewards, torch.Tensor)
+                        and rewards.ndim == 2
+                    ):
+                        rewards = rewards[:, valid_indices]
+                    if (
+                        torch is not None
+                        and isinstance(terminations, torch.Tensor)
+                        and terminations.ndim == 2
+                    ):
+                        terminations = terminations[:, valid_indices]
+
             final_obs = None
             last_info = None
             if isinstance(infos_list, (list, tuple)) and len(infos_list) > 0:
@@ -395,10 +428,24 @@ class RecordVideo(gym.Wrapper):
                 self.add_new_frames(reset_obs, None)
             else:
                 self.add_new_frames(obs_list, infos_list, rewards, terminations)
+
+    def chunk_step(self, *args, **kwargs):
+        """Step a chunk and record all frames from the chunk."""
+        result = self.env.chunk_step(*args, **kwargs)
+        self.record_video_in_result(result)
         return result
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
-        """Write buffered frames to an MP4 file (async)."""
+        """Write buffered frames to an MP4 file.
+
+        The encode happens on the background thread pool, but we wait for the
+        just-submitted write to complete before returning. The wait is required
+        so the MP4 has a finalized ``moov`` atom on disk: ``imageio`` only writes
+        it during ``writer.close()``, and the pool's worker threads are daemon
+        threads that get killed mid-task at interpreter exit (no ``atexit``
+        handler is run under Ray actor shutdown either). Without this wait,
+        eval videos end at ``mdat`` and no player can open them.
+        """
         if not self.render_images:
             return
 
@@ -413,13 +460,17 @@ class RecordVideo(gym.Wrapper):
         frames = list(self.render_images)
         self.render_images = []
         self.video_cnt += 1
-        self._submit_save(frames, mp4_path)
+        future = self._submit_save(frames, mp4_path)
+        # Block until the encode + writer.close() returns so the MP4 is valid
+        # on disk before the rollout loop continues (or the process exits).
+        future.result()
 
-    def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> None:
-        """Submit a background job to save the video."""
+    def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> Future:
+        """Submit a background job to save the video, return its Future."""
         self._prune_futures()
         future = self._executor.submit(self._save_video, frames, mp4_path)
         self._save_futures.append(future)
+        return future
 
     def _save_video(self, frames: list[np.ndarray], mp4_path: str) -> None:
         """Save frames to disk (runs in background)."""

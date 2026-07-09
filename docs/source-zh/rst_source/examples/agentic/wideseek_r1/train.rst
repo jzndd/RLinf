@@ -1,16 +1,44 @@
-训练
-====
+WideSeek-R1 训练
+========================================
 
 本页介绍如何在 RLinf 中复现 WideSeek-R1 的训练流程。
 
 参考配置使用 ``Qwen3-4B``，但当前流程也兼容 Qwen3 系列中的其他稠密模型。
+
+概述
+----------------------------------------
+
+使用本页准备 WideSeek-R1 训练所需的模型、数据与配置。
+
+.. grid:: 2 4 4 4
+   :gutter: 2
+
+   .. grid-item-card:: 模型
+      :text-align: center
+
+      Qwen3-4B
+
+   .. grid-item-card:: 算法
+      :text-align: center
+
+      Hybrid multi-agent RL
+
+   .. grid-item-card:: 数据
+      :text-align: center
+
+      WideSeek-R1-train-data 中的 ``hybrid_20k.jsonl``
+
+   .. grid-item-card:: 工具
+      :text-align: center
+
+      离线检索与 judge model server
 
 .. contents::
    :depth: 2
    :local:
 
 前置条件
---------
+----------------------------------------
 
 开始训练前，请确保以下组件已准备就绪：
 
@@ -19,7 +47,7 @@
 - 离线检索工具已配置完成。参见 :doc:`tools`。
 
 下载基础模型
-------------
+----------------------------------------
 
 主实验使用 `Qwen3-4B <https://huggingface.co/Qwen/Qwen3-4B>`__。
 
@@ -33,13 +61,17 @@
        model_path: /PATH/TO/MODEL
 
 下载训练数据
-------------
+----------------------------------------
 
 WideSeek-R1 训练使用一个 2 万条样本的混合数据集，该数据集将广域信息检索数据与标准 QA 数据结合在一起。数据集可在 Hugging Face 获取：
 
 - `WideSeek-R1-train-data <https://huggingface.co/datasets/RLinf/WideSeek-R1-train-data>`__
 
-主实验使用该数据集中的 ``hybrid_20k.jsonl``。
+主实验使用 ``WideSeek-R1-train-data`` 中的 ``hybrid_20k.jsonl``。
+
+另有单独的 `WideSeek-R1-Corpus <https://huggingface.co/datasets/RLinf/WideSeek-R1-Corpus>`__
+资源，供希望查看或复用公开语料资源的用户使用。它不是主实验使用的
+``hybrid_20k.jsonl`` 训练文件。
 
 下载数据后，更新 `examples/agent/wideseek_r1/config/train_qwen3_hybrid.yaml` 中的数据集路径：
 
@@ -50,7 +82,7 @@ WideSeek-R1 训练使用一个 2 万条样本的混合数据集，该数据集�
      is_hybrid: True
 
 关于 ``is_hybrid`` 和 ``is_markdown``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``is_hybrid`` 表示训练集是否混合了 WideSearch 风格数据和标准 QA 数据。
 
@@ -58,8 +90,8 @@ WideSeek-R1 训练使用一个 2 万条样本的混合数据集，该数据集�
 - 如果你使用的是单一来源数据集进行训练，例如 ``width_20k`` 或 ``depth_20k``，请设置 ``is_hybrid: False``。
 - 当 ``is_hybrid`` 为 ``False`` 时，请确保 ``data.is_markdown`` 与所使用数据集的格式一致（``width_20k`` 为 True，``depth_20k`` 为 False）。
 
-启动训练
---------
+运行
+----------------------------------------
 
 开始训练前，请确认以下各项均正确无误：
 
@@ -74,8 +106,8 @@ WideSeek-R1 训练使用一个 2 万条样本的混合数据集，该数据集�
 
    bash examples/agent/wideseek_r1/run_train.sh train_qwen3_hybrid
 
-输出
-----
+可视化与结果
+----------------------------------------
 
 训练输出会写入：
 
@@ -86,7 +118,7 @@ WideSeek-R1 训练使用一个 2 万条样本的混合数据集，该数据集�
 你可以查看该目录中的 TensorBoard 文件来监控训练指标。
 
 说明
-----
+----------------------------------------
 
 WideSeek-R1 同时支持单智能体和多智能体执行模式。可通过 YAML 配置中的 ``agentloop.workflow`` 进行切换：
 

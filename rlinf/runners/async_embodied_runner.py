@@ -14,20 +14,25 @@
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
+from rlinf.utils.metric_utils import compute_evaluate_metrics
 from rlinf.utils.runner_utils import check_progress
 
 if TYPE_CHECKING:
+    from rlinf.workers.actor.async_fsdp_dagger_policy_worker import (
+        AsyncEmbodiedDAGGERFSDPPolicy,
+    )
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
         AsyncEmbodiedSACFSDPPolicy,
     )
     from rlinf.workers.env.async_env_worker import AsyncEnvWorker
+    from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
     from rlinf.workers.rollout.hf.async_huggingface_worker import (
         AsyncMultiStepRolloutWorker,
     )
@@ -37,19 +42,17 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
     def __init__(
         self,
         cfg: DictConfig,
-        actor: "AsyncEmbodiedSACFSDPPolicy",
+        actor: Union["AsyncEmbodiedSACFSDPPolicy", "AsyncEmbodiedDAGGERFSDPPolicy"],
         rollout: "AsyncMultiStepRolloutWorker",
         env: "AsyncEnvWorker",
+        reward: "EmbodiedRewardWorker",
         critic=None,
-        reward=None,
-        run_timer=None,
     ):
-        super().__init__(cfg, actor, rollout, env, critic, reward, run_timer)
+        super().__init__(cfg, actor, rollout, env, reward, critic)
 
         # Data channels
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
-        self.replay_channel = Channel.create("ReplayBuffer")
 
         self._pending_rollout_weight_sync = None
         self._weight_sync_coalesced_total = 0
@@ -133,27 +136,60 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         self._pending_rollout_weight_sync = (rollout_handle, actor_handle)
 
+    def evaluate(self):
+        env_handle: Handle = self.env.evaluate(
+            input_channel=self.env_channel,
+            rollout_channel=self.rollout_channel,
+        )
+        env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
+        if not env_decoupled_mode:
+            rollout_handle: Handle = self.rollout.evaluate(
+                input_channel=self.rollout_channel,
+                output_channel=self.env_channel,
+            )
+        env_results = env_handle.wait()
+        if not env_decoupled_mode:
+            rollout_handle.wait()
+        eval_metrics_list = [results for results in env_results if results is not None]
+        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        return eval_metrics
+
     def run(self):
         start_step = self.global_step
         start_time = time.time()
         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
         env_handle: Handle = self.env.interact(
-            input_channel=self.rollout_channel,
-            output_channel=self.env_channel,
+            input_channel=self.env_channel,
+            rollout_channel=self.rollout_channel,
+            reward_channel=self.reward_channel,
+            actor_channel=self.actor_channel,
             metric_channel=self.env_metric_channel,
-            replay_channel=self.replay_channel,
         )
         rollout_handle: Handle = self.rollout.generate(
-            input_channel=self.env_channel,
-            output_channel=self.rollout_channel,
+            input_channel=self.rollout_channel,
+            output_channel=self.env_channel,
             metric_channel=self.rollout_metric_channel,
         )
+        if self.reward is not None:
+            reward_handle: Handle = self.reward.compute_rewards_async(
+                input_channel=self.reward_channel,
+                output_channel=self.env_channel,
+            )
         actor_handle: Handle = self.actor.recv_rollout_trajectories(
-            input_channel=self.replay_channel
+            input_channel=self.actor_channel
         )
 
         while self.global_step < self.max_steps:
+            # Use the step we're ABOUT to run as the profiling key, mirroring
+            # ``EmbodiedRunner.run`` which gates before ``self.global_step += 1``.
+            profiled_step = (
+                self.global_step
+                if self._should_profile_step(self.global_step)
+                else None
+            )
+            if profiled_step is not None:
+                self._open_profiling_window(profiled_step)
             skip_step = False
             with self.timer("step"):
                 actor_training_handle: Handle = self.actor.run_training()
@@ -193,12 +229,17 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
             if skip_step:
                 self.timer.consume_durations()
+                if profiled_step is not None:
+                    self._close_profiling_window(profiled_step)
                 time.sleep(1.0)
                 continue
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-            training_metrics["train/replay_channel_qsize"] = self.replay_channel.qsize()
+            if self.actor_channel is not None:
+                training_metrics["train/replay_channel_qsize"] = (
+                    self.actor_channel.qsize()
+                )
             actor_training_time_metrics, actor_time_metrics_per_rank = (
                 actor_training_handle.consume_durations(return_per_rank=True)
             )
@@ -264,11 +305,15 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 start_step,
             )
 
+            if profiled_step is not None:
+                self._close_profiling_window(profiled_step)
+
         self.env.stop().wait()
         self.rollout.stop().wait()
         self.actor.stop().wait()
+        if self.reward is not None:
+            self.reward.stop().wait()
+            reward_handle.wait()
         env_handle.wait()
         rollout_handle.wait()
         actor_handle.wait()
-
-        self._save_checkpoint()

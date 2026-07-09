@@ -14,6 +14,7 @@
 # openpi model configs
 
 import os
+import pathlib
 
 import torch
 from omegaconf import DictConfig
@@ -80,8 +81,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
         if not weight_paths:
             weight_paths = [os.path.join(checkpoint_dir, "model.safetensors")]
+        all_state_dict = {}
         for weight_path in weight_paths:
-            safetensors.torch.load_model(model, weight_path, strict=False)
+            state_dict = safetensors.torch.load_file(weight_path, device="cpu")
+            all_state_dict.update(state_dict)
+        model.load_state_dict(all_state_dict, strict=False)
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     # fsdp replace
@@ -90,8 +94,17 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     data_config = actor_train_config.data.create(
         actor_train_config.assets_dirs, actor_model_config
     )
-    norm_stats = None
-    if norm_stats is None:
+    norm_stats_path = (
+        data_kwargs.get("norm_stats_path") if data_kwargs is not None else None
+    )
+    if norm_stats_path is not None:
+        norm_stats = data_config.norm_stats
+        if norm_stats is None:
+            norm_dir = pathlib.Path(norm_stats_path).expanduser()
+            if norm_dir.is_file():
+                norm_dir = norm_dir.parent
+            norm_stats = _checkpoints.load_norm_stats(norm_dir.parent, norm_dir.name)
+    else:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:

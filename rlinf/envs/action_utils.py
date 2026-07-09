@@ -71,6 +71,8 @@ def prepare_actions_for_libero(
     if SupportedModel(model_type) in [
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
+        SupportedModel.GR00T_N1D6,
+        SupportedModel.GR00T_N1D7,
     ]:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
@@ -96,6 +98,34 @@ def prepare_actions_for_isaaclab(
     ]:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = torch.sign(chunk_actions[..., -1]) * -1.0
+    return chunk_actions
+
+
+def prepare_actions_for_polaris(
+    raw_chunk_actions,
+    model_type,
+) -> torch.Tensor:
+    """
+    Here reture a general 7 dof action. If the action is modified, please change the output of the model
+    For example, in `RLinf/rlinf/models/embodiment/gr00t/simulation_io.py`
+    """
+    chunk_actions = (
+        torch.from_numpy(raw_chunk_actions)
+        if isinstance(raw_chunk_actions, np.ndarray)
+        else raw_chunk_actions
+    )
+    if SupportedModel(model_type) in [
+        SupportedModel.OPENVLA,
+        SupportedModel.OPENVLA_OFT,
+    ]:
+        chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
+        chunk_actions[..., -1] = torch.sign(chunk_actions[..., -1]) * -1.0
+    elif SupportedModel(model_type) == SupportedModel.OPENPI:
+        chunk_actions[..., -1] = torch.where(
+            chunk_actions[..., -1] > 0.5,
+            torch.ones_like(chunk_actions[..., -1]),
+            torch.zeros_like(chunk_actions[..., -1]),
+        )
     return chunk_actions
 
 
@@ -171,6 +201,32 @@ def prepare_actions_for_robocasa(
     return chunk_actions
 
 
+def prepare_actions_for_genesis(
+    raw_chunk_actions,
+    model_type,
+) -> torch.Tensor:
+    """Prepare actions for the Genesis environment.
+
+    For VLA models (OpenVLA / OpenVLA-OFT), transforms the gripper
+    dimension from a [0, 1] continuous value to a {-1, +1} binary signal
+    (matching the convention used by other embodied envs).
+
+    For all other models the actions are returned as-is, converted to a
+    torch tensor on CUDA.
+    """
+    if isinstance(raw_chunk_actions, np.ndarray):
+        chunk_actions = torch.from_numpy(raw_chunk_actions).float()
+    else:
+        chunk_actions = raw_chunk_actions.clone().float()
+    if SupportedModel(model_type) in [
+        SupportedModel.OPENVLA,
+        SupportedModel.OPENVLA_OFT,
+    ]:
+        chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
+        chunk_actions[..., -1] = torch.sign(chunk_actions[..., -1]) * -1.0
+    return chunk_actions
+
+
 def prepare_actions_for_mujoco(raw_chunk_actions, model_type):
     if raw_chunk_actions.shape[-1] >= 7:
         chunk_actions = np.concatenate(
@@ -180,6 +236,30 @@ def prepare_actions_for_mujoco(raw_chunk_actions, model_type):
         chunk_actions = raw_chunk_actions[..., :4]
     if SupportedModel(model_type) == SupportedModel.OPENPI:
         chunk_actions[..., -1] = np.clip(chunk_actions[..., -1], -1.0, 1.0)
+    return chunk_actions
+
+
+def prepare_actions_for_d4rl(
+    raw_chunk_actions,
+    action_dim: int,
+    model_type,
+) -> np.ndarray:
+    # D4RL: take first action_dim dims from policy output
+    raw = np.asarray(raw_chunk_actions, dtype=np.float32)
+    chunk_actions = raw[..., :action_dim].copy()
+    # OPENPI: clip last dim to match continuous action space
+    if SupportedModel(model_type) == SupportedModel.OPENPI:
+        chunk_actions[..., -1] = np.clip(chunk_actions[..., -1], -1.0, 1.0)
+    return chunk_actions
+
+
+def prepare_actions_for_roboverse(
+    raw_chunk_actions,
+    model_type,
+) -> np.ndarray:
+    chunk_actions = raw_chunk_actions
+    if SupportedModel(model_type) == SupportedModel.OPENPI:
+        chunk_actions[..., -1] = np.where(chunk_actions[..., -1] < 0.0, 1.0, 0.0)
     return chunk_actions
 
 
@@ -193,11 +273,11 @@ def prepare_actions(
     policy: str = "widowx_bridge",
     wm_env_type=None,
 ) -> torch.Tensor | np.ndarray:
-    raw_chunk_actions = (
-        raw_chunk_actions.cpu().numpy()
-        if isinstance(raw_chunk_actions, torch.Tensor)
-        else raw_chunk_actions
-    )
+    if isinstance(raw_chunk_actions, torch.Tensor):
+        raw_chunk_actions = raw_chunk_actions.detach().cpu().contiguous()
+        if raw_chunk_actions.dtype == torch.bfloat16:
+            raw_chunk_actions = raw_chunk_actions.float()
+        raw_chunk_actions = raw_chunk_actions.numpy()
 
     env_type = SupportedEnvType(env_type)
     if env_type == SupportedEnvType.LIBERO:
@@ -214,7 +294,10 @@ def prepare_actions(
             )
         else:
             raise NotImplementedError(f"Env type {wm_env_type} not implemented")
-    elif env_type == SupportedEnvType.MANISKILL:
+    elif (
+        env_type == SupportedEnvType.MANISKILL
+        or env_type == SupportedEnvType.MANISKILL_RLT
+    ):
         chunk_actions = prepare_actions_for_maniskill(
             raw_chunk_actions=raw_chunk_actions,
             num_action_chunks=num_action_chunks,
@@ -223,6 +306,8 @@ def prepare_actions(
             policy=policy,
         )
     elif env_type == SupportedEnvType.ROBOTWIN:
+        chunk_actions = raw_chunk_actions
+    elif env_type == SupportedEnvType.EMBODICHAIN:
         chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.METAWORLD:
         chunk_actions = prepare_actions_for_metaworld(
@@ -249,12 +334,33 @@ def prepare_actions(
         )
     elif env_type == SupportedEnvType.REALWORLD:
         chunk_actions = raw_chunk_actions
+    elif env_type == SupportedEnvType.GENESIS:
+        chunk_actions = prepare_actions_for_genesis(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+        )
     elif env_type == SupportedEnvType.FRANKASIM:
         chunk_actions = prepare_actions_for_mujoco(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
         )
+    elif env_type == SupportedEnvType.D4RL:
+        chunk_actions = prepare_actions_for_d4rl(
+            raw_chunk_actions=raw_chunk_actions,
+            action_dim=action_dim,
+            model_type=model_type,
+        )
+    elif env_type == SupportedEnvType.ROBOVERSE:
+        chunk_actions = prepare_actions_for_roboverse(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+        )
+    elif env_type == SupportedEnvType.POLARIS:
+        chunk_actions = prepare_actions_for_polaris(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+        )
     else:
-        raise NotImplementedError
+        chunk_actions = raw_chunk_actions
 
     return chunk_actions

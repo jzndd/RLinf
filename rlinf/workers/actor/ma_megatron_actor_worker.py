@@ -23,7 +23,6 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.training.training import unwrap_model
 from megatron.training.utils import average_losses_across_data_parallel_group
 from omegaconf import DictConfig
-from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import (
@@ -49,7 +48,10 @@ from rlinf.utils.distributed import (
     vocab_parallel_entropy_and_log_probs,
     vocab_parallel_log_probs_from_logits,
 )
-from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
+from rlinf.utils.placement import (
+    ModelParallelComponentPlacement,
+    PlacementMode,
+)
 from rlinf.utils.utils import (
     clear_memory,
     configure_batch_sizes,
@@ -59,7 +61,6 @@ from rlinf.utils.utils import (
 from rlinf.workers.actor.megatron_actor_worker import (
     MegatronActor,
 )
-from rlinf.workers.rollout.utils import CollocateRankMapper, DisaggRankMapper
 
 
 class MAMegatronActor(MegatronActor):
@@ -75,8 +76,8 @@ class MAMegatronActor(MegatronActor):
         assert self.enable_dp_load_balance, (
             "enable_dp_load_balance must be True when is_dynamic_rollout_batch is True"
         )
+        self.placement = placement
 
-        self.use_fixed_worker = self.cfg.rollout.get("use_fixed_worker", False)
         assert self.placement_mode == PlacementMode.COLLOCATED, (
             "Only collocated placement is supported for multi-agent actor"
         )
@@ -196,7 +197,10 @@ class MAMegatronActor(MegatronActor):
 
                 advantages = batch["advantages"]
                 advantages *= batch["loss_scales"]
-                prev_logprobs = batch["prev_logprobs"]
+                # Prefer recomputed_logprobs, fallback to rollout_logprobs
+                old_logprobs = batch.get("recomputed_logprobs")
+                if old_logprobs is None:
+                    old_logprobs = batch["rollout_logprobs"]
                 ref_logprobs = None
                 if "ref_logprobs" in batch:
                     ref_logprobs = batch["ref_logprobs"]
@@ -205,11 +209,11 @@ class MAMegatronActor(MegatronActor):
                     assert False, (
                         "importance_sampling_fix is not supported for dynamic rollout batch"
                     )
-                    rollout_prev_logprobs = prev_logprobs
-                    recompute_prev_logprobs = batch["recompute_prev_logprobs"]
+                    rollout_logprobs = batch["rollout_logprobs"]
+                    recomputed_logprobs = batch.get("recomputed_logprobs")
                     advantages = advantages * torch.clamp(
-                        (recompute_prev_logprobs - rollout_prev_logprobs).exp(),
-                        min=self.cfg.algorithm.importance_sampling_clip,
+                        (recomputed_logprobs - rollout_logprobs).exp(),
+                        max=self.cfg.algorithm.importance_sampling_clip,
                     )
 
                 mask = batch["response_mask"]
@@ -219,7 +223,7 @@ class MAMegatronActor(MegatronActor):
                     loss_type=self.cfg.algorithm.loss_type,
                     loss_agg_func=self.loss_agg_func,
                     logprobs=curr_logprobs,
-                    old_logprobs=prev_logprobs,
+                    old_logprobs=old_logprobs,
                     advantages=advantages,
                     clip_ratio_c=self.clip_ratio_c,
                     clip_ratio_low=self.clip_ratio_low,
@@ -390,7 +394,7 @@ class MAMegatronActor(MegatronActor):
         batch = DynamicRolloutResult.merge_batches(
             batches, self.cfg.algorithm.group_size
         )
-        assert "prev_logprobs" in batch
+        assert "recomputed_logprobs" in batch or "rollout_logprobs" in batch
         # Compute advantages and returns
         batch = self.compute_advantages_and_returns(batch)
         batch["loss_scales"] = torch.ones_like(batch["advantages"]).masked_fill(
@@ -476,112 +480,6 @@ class MAMegatronActor(MegatronActor):
 
         return rollout_metrics, training_metrics_list
 
-    def _setup_rollout_weight_dst_ranks(self):
-        """Setup destination ranks for token and weight communication."""
-        assert self.placement_mode == PlacementMode.COLLOCATED
-        if not self.use_fixed_worker:
-            rank_mapper = CollocateRankMapper
-        else:
-            rank_mapper = DisaggRankMapper
-        rank_map = rank_mapper.get_actor_rank_to_rollout_rank_map(
-            self.component_placement.actor_tp_size,
-            self.component_placement.actor_pp_size,
-            self.component_placement.actor_world_size,
-            self.component_placement.rollout_tp_size,
-            self.component_placement.rollout_world_size,
-        )
-        self._weight_dst_rank_in_rollout = rank_map[self._rank]
-        self.log_info(
-            f"Actor rank {self._rank} will send weights to {self._weight_dst_rank_in_rollout}"
-        )
-
-    def sync_model_to_rollout(self):
-        """Send the model weights to the destination ranks in the rollout task."""
-        if not self.is_running:
-            return
-
-        # ensure weights are on GPU before reshard
-        with self.device_lock:
-            self.onload_model_weights_and_grad(load_grad=False)
-
-        model_bucket_list = self.divide_model_to_bucket()
-        if not hasattr(self, "sync_model_bucket_length"):
-            self.sync_model_bucket_length = len(model_bucket_list)
-        else:
-            assert self.sync_model_bucket_length == len(model_bucket_list), (
-                f"last sync_model_bucket_length {self.sync_model_bucket_length} don't equal now the len(model_bucket_list) {len(model_bucket_list)}"
-            )
-            assert self.sync_model_bucket_length != 0, (
-                "error the self.sync_model_bucket_length is 0"
-            )
-
-        self.model_state_offload_optimizer_and_grad()
-
-        # send bucket size
-        if len(self._weight_dst_rank_in_rollout) > 0:
-            if (
-                self.placement_mode == PlacementMode.COLLOCATED
-                and not self.use_fixed_worker
-            ):
-                send_handle = None
-                for bucket_weight in model_bucket_list:
-                    reshard_state_dict = self._get_rollout_model_state_dict(
-                        bucket_weight
-                    )
-                    buffer = {
-                        k: reduce_tensor(v) for k, v in reshard_state_dict.items()
-                    }
-                    if send_handle is not None:
-                        send_handle.wait()
-                    else:
-                        # add the bucket_length message in bucket 0
-                        buffer["bucket_length"] = len(model_bucket_list)
-                    send_handle = self.send(
-                        buffer,
-                        self.rollout_group_name,
-                        self._weight_dst_rank_in_rollout,
-                        async_op=True,
-                    )
-                    del reshard_state_dict
-                send_handle.wait()
-            else:
-                send_handle_bucket = []
-                for bucket_weight in model_bucket_list:
-                    reshard_state_dict = self._get_rollout_model_state_dict(
-                        bucket_weight
-                    )
-
-                    if len(send_handle_bucket) != 0:
-                        for send_handle in send_handle_bucket:
-                            send_handle.wait()
-                        send_handle_bucket = []
-                    else:
-                        # add the bucket_length message in bucket 0
-                        reshard_state_dict["bucket_length"] = len(model_bucket_list)
-
-                    for weight_dst_rank in self._weight_dst_rank_in_rollout:
-                        send_handle = self.send(
-                            reshard_state_dict,
-                            self.rollout_group_name,
-                            weight_dst_rank,
-                            async_op=True,
-                        )
-                        send_handle_bucket.append(send_handle)
-
-                if len(send_handle_bucket) != 0:
-                    for send_handle in send_handle_bucket:
-                        send_handle.wait()
-
-        if (
-            self.placement_mode == PlacementMode.COLLOCATED
-            or self.use_pre_process_policy
-        ):
-            if self.offload_weight:
-                self.offload_model_weights_and_grad(
-                    offload_grad=False, offload_weight=True
-                )
-                self.is_weight_offloaded = True
-
     def _compute_rollout_metrics(self, batch):
         rollout_metrics_compute_data_group = self.get_rollout_metrics_group(batch)
         if rollout_metrics_compute_data_group is None:
@@ -652,12 +550,10 @@ class MAMegatronActor(MegatronActor):
 
         self._load_weight_and_optimizer()
         with self.worker_timer():
-            # compute prev logprobs
-            prev_logprobs = self.inference_step(merged_batch).cpu()
-            if rollout_result.rollout_logprobs is not None:
-                rollout_result.recompute_prev_logprobs = prev_logprobs
-            else:
-                rollout_result.prev_logprobs = prev_logprobs
+            # compute recomputed logprobs
+            recomputed_logprobs = self.inference_step(merged_batch).cpu()
+            rollout_result.recomputed_logprobs = recomputed_logprobs
+
             if compute_ref_logprobs:
                 assert self.ref_policy_state_dict is not None, (
                     "ref_policy_state_dict must be set to compute ref_logprobs"
@@ -684,6 +580,10 @@ class MAMegatronActor(MegatronActor):
         with self.worker_timer():
             if batch.get("advantages", None) is None:
                 mask = batch["response_mask"]  # [num_sequence, seq_len]
+                logprob = batch.get("recomputed_logprobs")
+                if logprob is None:
+                    logprob = batch.get("rollout_logprobs")
+                logprob = logprob.cuda()
                 advantages, _ = calculate_adv_and_returns(
                     task_type=self.cfg.runner.task_type,
                     adv_type=self.cfg.algorithm.adv_type,
@@ -695,9 +595,7 @@ class MAMegatronActor(MegatronActor):
                     idx_to_traj=batch["idx_to_traj"],
                     kl_beta=self.cfg.algorithm.get("reinpp_kl_beta", 0.0),
                     kl_penalty_type=self.kl_penalty_type,
-                    logprob=batch["prev_logprobs"].cuda()
-                    if "prev_logprobs" in batch
-                    else None,
+                    logprob=logprob,
                     ref_logprob=batch["ref_logprobs"].cuda()
                     if "ref_logprobs" in batch
                     else None,

@@ -16,7 +16,7 @@ import asyncio
 
 from omegaconf.omegaconf import DictConfig
 
-from rlinf.scheduler import Channel
+from rlinf.scheduler import Channel, Worker
 from rlinf.workers.env.env_worker import EnvWorker
 
 
@@ -24,21 +24,29 @@ class AsyncEnvWorker(EnvWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self._interact_task: asyncio.Task = None
-        assert not self.enable_offload, "Offload not supported in AsyncEnvWorker"
+        assert not (self.train_enable_offload or self.eval_enable_offload), (
+            "Offload not supported in AsyncEnvWorker"
+        )
 
+    @Worker.timer("interact")
     async def interact(
         self,
         input_channel: Channel,
-        output_channel: Channel,
+        rollout_channel: Channel,
+        reward_channel: Channel | None,
+        actor_channel: Channel | None,
         metric_channel: Channel,
-        replay_channel: Channel | None = None,
     ):
         assert self._interact_task is None or self._interact_task.done(), (
             "Previous interact task is still running while a new interact call is made."
         )
         self._interact_task = asyncio.create_task(
             self._interact(
-                input_channel, output_channel, metric_channel, replay_channel
+                input_channel,
+                rollout_channel,
+                reward_channel,
+                actor_channel,
+                metric_channel,
             )
         )
         try:
@@ -49,15 +57,17 @@ class AsyncEnvWorker(EnvWorker):
     async def _interact(
         self,
         input_channel: Channel,
-        output_channel: Channel,
+        rollout_channel: Channel,
+        reward_channel: Channel | None,
+        actor_channel: Channel | None,
         metric_channel: Channel,
-        replay_channel: Channel | None,
     ):
         while True:
             env_metrics = await self._run_interact_once(
                 input_channel,
-                output_channel,
-                replay_channel,
+                rollout_channel,
+                reward_channel,
+                actor_channel,
                 cooperative_yield=True,
             )
 

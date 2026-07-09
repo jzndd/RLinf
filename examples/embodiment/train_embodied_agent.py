@@ -23,6 +23,7 @@ from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
+from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 mp.set_start_method("spawn", force=True)
@@ -42,18 +43,58 @@ def main(cfg) -> None:
 
     # Create actor worker group
     actor_placement = component_placement.get_strategy("actor")
+    use_training_pipeline = bool(cfg.runner.get("use_training_pipeline", False))
 
     if cfg.algorithm.loss_type == "embodied_sac":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for embodied_sac."
+            )
         from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
         actor_worker_cls = EmbodiedSACFSDPPolicy
-    else:
-        from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+    elif cfg.algorithm.loss_type == "rlt_ac":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for rlt_ac."
+            )
+        from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
 
-        actor_worker_cls = EmbodiedFSDPActor
+        actor_worker_cls = RLTACFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_dagger":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for embodied_dagger."
+            )
+        from rlinf.workers.actor.fsdp_dagger_policy_worker import (
+            EmbodiedDAGGERFSDPPolicy,
+        )
+
+        actor_worker_cls = EmbodiedDAGGERFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_nft":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for embodied_nft."
+            )
+        from rlinf.workers.actor.fsdp_nft_policy_worker import EmbodiedNFTFSDPPolicy
+
+        actor_worker_cls = EmbodiedNFTFSDPPolicy
+    else:
+        if use_training_pipeline:
+            from rlinf.workers.actor.fsdp_actor_worker_pipeline import (
+                PipelineEmbodiedFSDPActor,
+            )
+
+            actor_worker_cls = PipelineEmbodiedFSDPActor
+        else:
+            from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+            actor_worker_cls = EmbodiedFSDPActor
+
     actor_group = actor_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
     )
+
     # Create rollout worker group
     rollout_placement = component_placement.get_strategy("rollout")
     rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
@@ -66,11 +107,22 @@ def main(cfg) -> None:
         cluster, name=cfg.env.group_name, placement_strategy=env_placement
     )
 
+    reward_group = None
+    if cfg.get("reward", {}).get("use_reward_model", False) and not cfg.get(
+        "reward", {}
+    ).get("standalone_realworld", False):
+        # Create reward worker group
+        reward_placement = component_placement.get_strategy("reward")
+        reward_group = EmbodiedRewardWorker.create_group(cfg).launch(
+            cluster, name=cfg.reward.group_name, placement_strategy=reward_placement
+        )
+
     runner = EmbodiedRunner(
         cfg=cfg,
         actor=actor_group,
         rollout=rollout_group,
         env=env_group,
+        reward=reward_group,
     )
 
     runner.init_workers()

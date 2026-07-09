@@ -1,10 +1,39 @@
 Reinforcement Learning Training of Search-R1
 ================================================
 
-Multi-turn RL with tool calls has been proven to extend the interaction boundary of large language models (LLMs) to the real world.  
-This document describes how to reproduce the experiments from  
-`Search-R1: Training LLMs to Reason and Leverage Search Engines with Reinforcement Learning <https://arxiv.org/abs/2503.09516>`__  
-under the RLinf framework, using reinforcement learning (RL) to train LLMs to answer questions by invoking search tools.
+Multi-turn RL with tool calls extends the interaction boundary of large language models (LLMs) to the real world.
+Reproduce the experiments from
+`Search-R1: Training LLMs to Reason and Leverage Search Engines with Reinforcement Learning <https://arxiv.org/abs/2503.09516>`__
+in RLinf, training LLMs to answer questions by invoking search tools.
+
+Overview
+--------
+
+Use this recipe to train a search-augmented reasoning model with a local wiki
+retrieval server.
+
+.. grid:: 2 4 4 4
+   :gutter: 2
+
+   .. grid-item-card:: Model
+      :text-align: center
+
+      Qwen2.5-3B-Instruct
+
+   .. grid-item-card:: Algorithm
+      :text-align: center
+
+      Multi-turn RL with search-tool calls
+
+   .. grid-item-card:: Tools
+      :text-align: center
+
+      FAISS or Qdrant local wiki server
+
+   .. grid-item-card:: Hardware
+      :text-align: center
+
+      Reference run on 8×H100
 
 Environment
 -----------
@@ -12,17 +41,16 @@ Environment
 RLinf Environment
 ~~~~~~~~~~~~~~~~~
 
-RLinf environment setup follows:  
-`RLinf Installation <https://rlinf.readthedocs.io/en/latest/rst_source/start/installation.html>`__
+RLinf environment setup follows :doc:`RLinf Installation </rst_source/start/installation>`.
 
 Local Wiki Server Environment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-We use the local retrieval server from the Search-R1 example.  
-Install faiss via conda; details in  
-`SearchR1 <https://raw.githubusercontent.com/PeterGriffinJin/Search-R1/refs/heads/main/docs/retriever.md>`__  
-and installation reference in  
-`Search-R1 & veRL-SGLang <https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/tool_examples/verl-multiturn-searchR1-like_ZH.md>`__  
+We use the local retrieval server from the Search-R1 example.
+Install faiss via conda; details in
+`SearchR1 <https://raw.githubusercontent.com/PeterGriffinJin/Search-R1/refs/heads/main/docs/retriever.md>`__
+and installation reference in
+`Search-R1 & veRL-SGLang <https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/tool_examples/verl-multiturn-searchR1-like_ZH.md>`__
 The environment is also configured via conda.
 
 .. code-block:: bash
@@ -51,7 +79,7 @@ The downloaded files are approximately 50–60 GB in size.
    save_path=/the/path/to/save
    python examples/agent/searchr1/download.py --save_path $save_path
 
-Download the `e5-base-v2 <https://huggingface.co/intfloat/e5-base-v2>`__ embedding model from HuggingFace,  
+Download the `e5-base-v2 <https://huggingface.co/intfloat/e5-base-v2>`__ embedding model from HuggingFace,
 and build the index
 
 .. code-block:: bash
@@ -82,7 +110,7 @@ Write the paths to the previously downloaded wiki files and the index into examp
                                                --retriever_model $retriever_path \
                                                --faiss_gpu --port 8000
 
-Run `launch_local_server.sh` to start the Local Wiki Server.  
+Run `launch_local_server.sh` to start the Local Wiki Server.
 Wait until server IP information is printed — indicating successful startup.
 
 (Optional) Using Qdrant as Local Wiki Server
@@ -129,8 +157,8 @@ Qdrant uses the HNSW graph index algorithm by default. For details on optimizing
 Training on 8×H100
 ------------------
 
-Download the `training dataset <https://huggingface.co/datasets/RLinf/Search-R1-Data>`__ from HuggingFace  
-and write its path into `examples/agent/searchr1/config/qwen2.5-3b-tool-1node.yaml`:
+Download the `training dataset <https://huggingface.co/datasets/RLinf/Search-R1-Data>`__ from HuggingFace
+and write its path into `examples/agent/searchr1/config/train_qwen2.5.yaml`:
 
 .. code-block:: yaml
 
@@ -139,7 +167,7 @@ and write its path into `examples/agent/searchr1/config/qwen2.5-3b-tool-1node.ya
      train_data_paths: ["/path/to/train.jsonl"]
      val_data_paths: ["/path/to/train.jsonl"]
 
-Modify `rollout.model.model_path` in `qwen2.5-3b-tool-1node.yaml`:
+Modify `rollout.model.model_path` in `train_qwen2.5.yaml`:
 
 .. code-block:: yaml
 
@@ -151,7 +179,7 @@ Modify `rollout.model.model_path` in `qwen2.5-3b-tool-1node.yaml`:
        model_path: /path/to/model/Qwen2.5-3B-Instruct
        model_type: qwen2.5
 
-If you use sampling_params.stop to control model stop and save training time, detokenize should be set to True.
+If you use `sampling_params.stop` to control model stop and save training time, detokenize should be set to True.
 
 .. code-block:: yaml
 
@@ -159,9 +187,9 @@ If you use sampling_params.stop to control model stop and save training time, de
       ……
       distributed_executor_backend: mp   # ray or mp
       disable_log_stats: False
-      detokenize: True  
+      detokenize: True
 
-Since search-R1 will re-tokenize the model output, recompute_logprobs should be set to True.
+Since Search-R1 will re-tokenize the model output, `recompute_logprobs`` should be set to True.
 
 .. code-block:: yaml
 
@@ -170,10 +198,10 @@ Since search-R1 will re-tokenize the model output, recompute_logprobs should be 
       recompute_logprobs: True
       shuffle_rollout: False
 
-Run `examples/agent/searchr1/run_main_searchr1_single.sh` to start training.
+Run `bash examples/agent/searchr1/run_train.sh` to start training.
 
-Evaluation
-----------
+Standalone Evaluation
+---------------------
 
 Run the following commands to convert a Megatron checkpoint into a HuggingFace model:
 
@@ -203,8 +231,8 @@ Run the following commands to convert a Megatron checkpoint into a HuggingFace m
    shopt -s extglob
    cp "${CKPT_PATH_ORIGINAL_HF}"/!(*model.safetensors.index.json) "${CKPT_PATH_HF}"
 
-Fill the converted HuggingFace model path into  
-`examples/agent/searchr1/config/qwen2.5-3b-tool-1node-eval.yaml`:
+Fill the converted HuggingFace model path into
+`examples/agent/searchr1/config/eval_qwen2.5.yaml`:
 
 .. code-block:: yaml
 
@@ -225,10 +253,10 @@ Modify the evaluation dataset path:
      train_data_paths: ["/path/to/eval.jsonl"]
      val_data_paths: ["/path/to/eval.jsonl"]
 
-Run `examples/agent/searchr1/run_main_searchr1_single_eval.sh` to start evaluation.
+Run `bash examples/agent/searchr1/run_eval.sh` to start evaluation.
 
-Training Curves
----------------
+Visualization and Results
+-------------------------
 
 The following shows the reward curves and training time curves.
 
@@ -236,7 +264,7 @@ The following shows the reward curves and training time curves.
 
    <div style="display: flex; justify-content: space-between; gap: 10px;">
      <div style="flex: 1; text-align: center;">
-       <img src="https://github.com/RLinf/misc/raw/main/pic/searchr1.png" style="width: 100%;"/>
+       <img src="https://raw.githubusercontent.com/RLinf/misc/main/pic/searchr1.png" style="width: 100%;"/>
        <p><em>Qwen2.5-3B-Instruct in RLinf</em></p>
      </div>
    </div>
@@ -247,7 +275,7 @@ Compared to the original performance (133s per step after response length stabil
 
    <div style="display: flex; justify-content: space-between; gap: 10px;">
      <div style="flex: 1; text-align: center;">
-       <img src="https://github.com/RLinf/misc/raw/main/pic/searchr1_orig_impl_time.png" style="width: 35%;"/>
+       <img src="https://raw.githubusercontent.com/RLinf/misc/main/pic/searchr1_orig_impl_time.png" style="width: 35%;"/>
        <p><em>Qwen2.5-3B-Instruct in original implementation at PeterGriffinJin/Search-R1</em></p>
      </div>
    </div>
@@ -257,7 +285,7 @@ References
 
 search-r1: https://github.com/PeterGriffinJin/Search-R1
 
-Search-R1 & veRL-SGLang:  
+Search-R1 & veRL-SGLang:
 https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/tool_examples/verl-multiturn-searchR1-like_ZH.md
 
 Asearcher: https://github.com/inclusionAI/ASearcher

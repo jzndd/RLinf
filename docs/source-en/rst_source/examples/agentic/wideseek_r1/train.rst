@@ -1,10 +1,38 @@
-Training
-========
+WideSeek-R1 Training
+====================
 
 This page describes how to reproduce WideSeek-R1 training in RLinf.
 
 The reference configuration uses ``Qwen3-4B``, but the current pipeline is also
 compatible with other dense models in the Qwen3 family.
+
+Overview
+--------
+
+Use this page to prepare the model, data, and config for WideSeek-R1 training.
+
+.. grid:: 2 4 4 4
+   :gutter: 2
+
+   .. grid-item-card:: Model
+      :text-align: center
+
+      Qwen3-4B
+
+   .. grid-item-card:: Algorithm
+      :text-align: center
+
+      Hybrid multi-agent RL
+
+   .. grid-item-card:: Data
+      :text-align: center
+
+      ``hybrid_20k.jsonl`` from WideSeek-R1-train-data
+
+   .. grid-item-card:: Tools
+      :text-align: center
+
+      Offline retrieval and judge model server
 
 .. contents::
    :depth: 2
@@ -45,7 +73,13 @@ Hugging Face:
 
 - `WideSeek-R1-train-data <https://huggingface.co/datasets/RLinf/WideSeek-R1-train-data>`__
 
-The main experiments use ``hybrid_20k.jsonl`` from that dataset.
+The main experiments use ``hybrid_20k.jsonl`` from
+``WideSeek-R1-train-data``.
+
+A separate `WideSeek-R1-Corpus <https://huggingface.co/datasets/RLinf/WideSeek-R1-Corpus>`__
+artifact is also available for users who want to inspect or reuse the public
+corpus resources. It is not the ``hybrid_20k.jsonl`` training file used by the
+main experiments.
 
 After downloading the data, update
 `examples/agent/wideseek_r1/config/train_qwen3_hybrid.yaml`
@@ -69,8 +103,8 @@ standard QA data.
 - When ``is_hybrid`` is ``False``, make sure ``data.is_markdown`` matches the
   dataset format you use (True for ``width_20k``, False for ``depth_20k``).
 
-Launch Training
----------------
+Run It
+------
 
 Before starting training, verify all of the following:
 
@@ -85,8 +119,8 @@ Then run:
 
    bash examples/agent/wideseek_r1/run_train.sh train_qwen3_hybrid
 
-Outputs
--------
+Visualization and Results
+-------------------------
 
 Training outputs are written to:
 

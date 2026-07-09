@@ -28,7 +28,11 @@ from rlinf.utils.distributed import (
     vocab_parallel_entropy_and_log_probs,
     vocab_parallel_log_probs_from_logits,
 )
-from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
+from rlinf.utils.placement import (
+    ModelParallelComponentPlacement,
+    PlacementMode,
+    RolloutSyncMode,
+)
 from rlinf.utils.resharding.mcore_weight_reshard import MegatronCoreWeightReshard
 from rlinf.utils.resharding.reshard_config import ReshardConfig
 from rlinf.utils.utils import retrieve_model_state_dict_in_cpu
@@ -105,13 +109,7 @@ class MegatronActor(MegatronWorker):
         self._setup_rollout_weight_dst_ranks()
 
     def process_inference_output(self, rollout_result, infer_out):
-        prev_logprobs = infer_out
-        if rollout_result.rollout_logprobs is not None:
-            # Rollout has returned logprobs, store the recomputed logprobs in recompute_prev_logprobs
-            rollout_result.recompute_prev_logprobs = prev_logprobs
-        else:
-            # Otherwise, store the logprobs in prev_logprobs (the final logprobs used for training)
-            rollout_result.prev_logprobs = prev_logprobs
+        rollout_result.recomputed_logprobs = infer_out
 
     def get_forward_step_func(self):
         """Acquire the forward step function for the model."""
@@ -191,17 +189,27 @@ class MegatronActor(MegatronWorker):
                 ].contiguous()
 
                 advantages = batch["advantages"]
-                prev_logprobs = batch["prev_logprobs"]
+                # Prefer recomputed_logprobs (from actor inference), fallback to rollout_logprobs
+                old_logprobs = batch.get("recomputed_logprobs")
+                if old_logprobs is None:
+                    old_logprobs = batch["rollout_logprobs"]
                 ref_logprobs = None
                 if "ref_logprobs" in batch:
                     ref_logprobs = batch["ref_logprobs"]
 
                 if self.cfg.algorithm.get("importance_sampling_fix", False):
-                    rollout_prev_logprobs = prev_logprobs
-                    recompute_prev_logprobs = batch["recompute_prev_logprobs"]
+                    if (
+                        "rollout_logprobs" not in batch
+                        or "recomputed_logprobs" not in batch
+                    ):
+                        raise ValueError(
+                            "importance_sampling_fix requires both rollout_logprobs and recomputed_logprobs"
+                        )
+                    rollout_logprobs = batch["rollout_logprobs"]
+                    recomputed_logprobs = batch["recomputed_logprobs"]
                     advantages = advantages * torch.clamp(
-                        (recompute_prev_logprobs - rollout_prev_logprobs).exp(),
-                        min=self.cfg.algorithm.importance_sampling_clip,
+                        (recomputed_logprobs - rollout_logprobs).exp(),
+                        max=self.cfg.algorithm.importance_sampling_clip,
                     )
 
                 mask = batch["response_mask"][:, -response_len:]
@@ -211,7 +219,7 @@ class MegatronActor(MegatronWorker):
                     loss_type=self.cfg.algorithm.loss_type,
                     loss_agg_func=self.loss_agg_func,
                     logprobs=curr_logprobs,
-                    old_logprobs=prev_logprobs,
+                    old_logprobs=old_logprobs,
                     advantages=advantages,
                     clip_ratio_c=self.clip_ratio_c,
                     clip_ratio_low=self.clip_ratio_low,
@@ -309,7 +317,9 @@ class MegatronActor(MegatronWorker):
         return model_bucket_list
 
     def sync_model_to_rollout(self):
-        """Send the model weights to the destination ranks in the rollout task."""
+        """
+        Sync the model's full state dict to the rollout worker.
+        """
         if self.recreate_nccl_groups:
             nccl_group_recreate()
         if not self.is_running:
@@ -334,55 +344,40 @@ class MegatronActor(MegatronWorker):
 
         # send bucket size
         if len(self._weight_dst_rank_in_rollout) > 0:
-            if self.placement_mode == PlacementMode.COLLOCATED:
-                send_handle = None
-                for bucket_weight in model_bucket_list:
-                    reshard_state_dict = self._get_rollout_model_state_dict(
-                        bucket_weight
-                    )
-                    buffer = {
-                        k: reduce_tensor(v) for k, v in reshard_state_dict.items()
-                    }
-                    if send_handle is not None:
-                        send_handle.wait()
-                    else:
-                        # add the bucket_length message in bucket 0
-                        buffer["bucket_length"] = len(model_bucket_list)
+            send_handles = []
+            for bucket_idx, bucket_weight in enumerate(model_bucket_list):
+                buffer = self._get_rollout_model_state_dict(bucket_weight)
+                if self.rollout_sync_mode == RolloutSyncMode.COLLOCATED:
+                    buffer = {k: reduce_tensor(v) for k, v in buffer.items()}
+                if bucket_idx == 0:
+                    # add the bucket_length message in bucket 0
+                    buffer["bucket_length"] = len(model_bucket_list)
+
+                for send_handle in send_handles:
+                    send_handle.wait()
+                send_handles = []
+
+                if self.rollout_sync_mode == RolloutSyncMode.COLLOCATED:
                     send_handle = self.send(
                         buffer,
                         self.rollout_group_name,
                         self._weight_dst_rank_in_rollout,
                         async_op=True,
                     )
-                    del reshard_state_dict
-                send_handle.wait()
-            else:
-                send_handle_bucket = []
-                for bucket_weight in model_bucket_list:
-                    reshard_state_dict = self._get_rollout_model_state_dict(
-                        bucket_weight
-                    )
-
-                    if len(send_handle_bucket) != 0:
-                        for send_handle in send_handle_bucket:
-                            send_handle.wait()
-                        send_handle_bucket = []
-                    else:
-                        # add the bucket_length message in bucket 0
-                        reshard_state_dict["bucket_length"] = len(model_bucket_list)
-
+                    send_handles.append(send_handle)
+                else:
                     for weight_dst_rank in self._weight_dst_rank_in_rollout:
                         send_handle = self.send(
-                            reshard_state_dict,
+                            buffer,
                             self.rollout_group_name,
                             weight_dst_rank,
                             async_op=True,
                         )
-                        send_handle_bucket.append(send_handle)
+                        send_handles.append(send_handle)
+                del buffer
 
-                if len(send_handle_bucket) != 0:
-                    for send_handle in send_handle_bucket:
-                        send_handle.wait()
+            for send_handle in send_handles:
+                send_handle.wait()
 
         if (
             self.placement_mode == PlacementMode.COLLOCATED
