@@ -1036,7 +1036,54 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
             model.load_state_dict(model_dict)
 
+        self._reset_noise_params_if_requested(model)
         return model
+
+    def load_checkpoint(self, load_path: str) -> None:
+        super().load_checkpoint(load_path)
+        self._reset_noise_params_if_requested(self.model)
+
+    def _reset_noise_params_if_requested(self, model: nn.Module) -> None:
+        openpi_cfg = self.cfg.actor.model.get("openpi", None)
+        if openpi_cfg is None or not openpi_cfg.get("reset_noise_param", False):
+            return
+
+        unwrapped_model = getattr(model, "module", model)
+        noise_head = getattr(unwrapped_model, "noise_head", None)
+        model_config = getattr(unwrapped_model, "config", None)
+        if noise_head is None or model_config is None:
+            return
+        if not hasattr(noise_head, "set_noise_range"):
+            return
+
+        noise_logvar_range = getattr(model_config, "noise_logvar_range", None)
+        if noise_logvar_range is None:
+            return
+
+        gripper_noise_logvar_range = getattr(
+            model_config, "gripper_noise_logvar_range", None
+        )
+        gripper_dim = getattr(model_config, "action_env_dim", None)
+        if gripper_dim is not None:
+            gripper_dim = int(gripper_dim) - 1
+
+        noise_head.set_noise_range(
+            list(noise_logvar_range),
+            gripper_noise_logvar_range=list(gripper_noise_logvar_range)
+            if gripper_noise_logvar_range is not None
+            else None,
+            gripper_dim=gripper_dim,
+        )
+        if self._rank == 0:
+            std_min = torch.exp(0.5 * noise_head.logvar_min.detach()).flatten()[0].item()
+            std_max = torch.exp(0.5 * noise_head.logvar_max.detach()).flatten()[0].item()
+            self._logger.info(
+                "Reset flow-noise std range from config: action=[%s, %s], gripper_dim=%s, gripper=%s",
+                std_min,
+                std_max,
+                noise_head.gripper_dim,
+                noise_head.gripper_noise_logvar_range,
+            )
 
     async def sync_model_to_rollout(self) -> None:
         """

@@ -63,17 +63,42 @@ class OfflineEmbodiedGRPORunner:
         self.actor.init_worker().wait()
 
         resume_dir = self.cfg.runner.resume_dir
-        if resume_dir is None:
+        if resume_dir is not None:
+            actor_checkpoint_path = os.path.join(resume_dir, "actor")
+            assert os.path.exists(actor_checkpoint_path), (
+                f"resume_dir {actor_checkpoint_path} does not exist."
+            )
+            self.actor.load_checkpoint(actor_checkpoint_path).wait()
+            self.global_step = int(resume_dir.split("global_step_")[-1])
             return
 
-        actor_checkpoint_path = os.path.join(resume_dir, "actor")
-        assert os.path.exists(actor_checkpoint_path), (
-            f"resume_dir {actor_checkpoint_path} does not exist."
-        )
-        self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        self.global_step = int(resume_dir.split("global_step_")[-1])
+        ckpt_path = self.cfg.runner.get("ckpt_path", None)
+        if ckpt_path:
+            ckpt_path = str(ckpt_path)
+            if "global_step_" in ckpt_path:
+                step_text = ckpt_path.split("global_step_")[-1].split("/")[0]
+                if step_text.isdigit():
+                    self.global_step = int(step_text)
 
     def run(self) -> None:
+        if bool(self.cfg.runner.get("only_eval", False)):
+            dataset_offline_eval_metrics = {}
+            if bool(self.cfg.data.get("if_offline_eval", False)):
+                eval_handle: Handle = self.actor.run_dataset_offline_eval()
+                dataset_offline_eval_metrics = self._aggregate_numeric_metrics(
+                    eval_handle.wait()
+                )
+
+            dataset_offline_eval_metrics = {
+                f"dataset_offline_eval/{k}": v
+                for k, v in dataset_offline_eval_metrics.items()
+            }
+            if dataset_offline_eval_metrics:
+                self.metric_logger.log(dataset_offline_eval_metrics, self.global_step)
+                logger.info("Offline eval metrics: %s", dataset_offline_eval_metrics)
+            self.metric_logger.finish()
+            return
+
         start_step = self.global_step
         global_pbar = tqdm(
             initial=start_step,

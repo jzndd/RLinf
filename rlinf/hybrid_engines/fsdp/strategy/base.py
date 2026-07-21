@@ -209,43 +209,43 @@ class FSDPStrategyBase(ABC):
         """
         clear_memory()
         torch.distributed.barrier()
-        # opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
-        # try:
-        #     training_state = Checkpoint(
-        #         model,
-        #         optimizers,
-        #         lr_schedulers,
-        #         opts,
-        #         fsdp_version=cls.get_fsdp_version(),
-        #         checkpoint_format=checkpoint_format,
-        #     )
-        #     if checkpoint_format == "local_shard":
-        #         local_shard_save_path = os.path.join(
-        #             save_path, "local_shard_checkpoint"
-        #         )
-        #         rank = torch.distributed.get_rank()
-        #         os.makedirs(local_shard_save_path, exist_ok=True)
-        #         torch.save(
-        #             training_state.state_dict(),
-        #             os.path.join(local_shard_save_path, f"checkpoint_rank_{rank}.pt"),
-        #         )
-        #     else:
-        #         from torch.distributed import checkpoint as dcp
+        opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
+        try:
+            training_state = Checkpoint(
+                model,
+                optimizers,
+                lr_schedulers,
+                opts,
+                fsdp_version=cls.get_fsdp_version(),
+                checkpoint_format=checkpoint_format,
+            )
+            if checkpoint_format == "local_shard":
+                local_shard_save_path = os.path.join(
+                    save_path, "local_shard_checkpoint"
+                )
+                rank = torch.distributed.get_rank()
+                os.makedirs(local_shard_save_path, exist_ok=True)
+                torch.save(
+                    training_state.state_dict(),
+                    os.path.join(local_shard_save_path, f"checkpoint_rank_{rank}.pt"),
+                )
+            else:
+                from torch.distributed import checkpoint as dcp
 
-        #         dcp_save_path = os.path.join(save_path, "dcp_checkpoint")
-        #         dcp.save(
-        #             {"fsdp_checkpoint": training_state},
-        #             checkpoint_id=dcp_save_path,
-        #         )
+                dcp_save_path = os.path.join(save_path, "dcp_checkpoint")
+                dcp.save(
+                    {"fsdp_checkpoint": training_state},
+                    checkpoint_id=dcp_save_path,
+                )
 
-        # except BaseException as e:
-        #     import traceback
+        except BaseException as e:
+            import traceback
 
-        #     if hasattr(cls, "logger") and cls.logger is not None:
-        #         cls.logger.error(f"Failed to save checkpoint to {save_path}: {e}")
-        #     traceback.print_exc()
-        #     raise e
-        # torch.distributed.barrier()
+            if hasattr(cls, "logger") and cls.logger is not None:
+                cls.logger.error(f"Failed to save checkpoint to {save_path}: {e}")
+            traceback.print_exc()
+            raise e
+        torch.distributed.barrier()
 
         if save_full_model_weights:
             opts = StateDictOptions(full_state_dict=True, cpu_offload=True)

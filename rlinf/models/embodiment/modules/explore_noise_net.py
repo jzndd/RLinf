@@ -46,6 +46,8 @@ class ExploreNoiseNet(nn.Module):
         activation_type: str,
         noise_logvar_range: list,  # [min_std, max_std]
         noise_scheduler_type: str,
+        gripper_noise_logvar_range: list | None = None,  # [min_std, max_std]
+        gripper_dim: int | None = None,
     ):
         super().__init__()
         self.mlp_logvar = MLP(
@@ -54,29 +56,60 @@ class ExploreNoiseNet(nn.Module):
             out_activation_type="Identity",
         )
         self.noise_scheduler_type = noise_scheduler_type
-        self.set_noise_range(noise_logvar_range)
+        self.out_dim = out_dim
+        self.set_noise_range(
+            noise_logvar_range,
+            gripper_noise_logvar_range=gripper_noise_logvar_range,
+            gripper_dim=gripper_dim,
+        )
 
-    def set_noise_range(self, noise_logvar_range: list):
-        self.noise_logvar_range = noise_logvar_range
+    def set_noise_range(
+        self,
+        noise_logvar_range: list,
+        gripper_noise_logvar_range: list | None = None,
+        gripper_dim: int | None = None,
+    ):
+        self.noise_logvar_range = list(noise_logvar_range)
+        self.gripper_noise_logvar_range = (
+            list(noise_logvar_range)
+            if gripper_noise_logvar_range is None
+            else list(gripper_noise_logvar_range)
+        )
+        self.gripper_dim = gripper_dim
+        self.use_gripper_noise_range = gripper_dim is not None
+        if self.use_gripper_noise_range:
+            if self.gripper_dim < 0 or self.gripper_dim >= self.out_dim:
+                raise ValueError(
+                    f"gripper_dim={self.gripper_dim} is outside noise output dim {self.out_dim}"
+                )
+
         noise_logvar_min = self.noise_logvar_range[0]
         noise_logvar_max = self.noise_logvar_range[1]
+        existing_buffer = getattr(self, "logvar_min", None)
+        tensor_kwargs = {"dtype": torch.float32}
+        if isinstance(existing_buffer, torch.Tensor):
+            tensor_kwargs["device"] = existing_buffer.device
+            tensor_kwargs["dtype"] = existing_buffer.dtype
         self.register_buffer(
             "logvar_min",
-            torch.log(torch.tensor(noise_logvar_min**2, dtype=torch.float32)).unsqueeze(
-                0
-            ),
+            torch.log(torch.tensor(noise_logvar_min**2, **tensor_kwargs)).unsqueeze(0),
         )
         self.register_buffer(
             "logvar_max",
-            torch.log(torch.tensor(noise_logvar_max**2, dtype=torch.float32)).unsqueeze(
-                0
-            ),
+            torch.log(torch.tensor(noise_logvar_max**2, **tensor_kwargs)).unsqueeze(0),
         )
 
     def forward(self, noise_feature: torch.Tensor):
         if "const" in self.noise_scheduler_type:  # const or const_schedule_itr
             # pick the lowest noise level when we use constant noise schedulers.
             noise_std = torch.exp(0.5 * self.logvar_min)
+            if self.use_gripper_noise_range:
+                noise_std = noise_std.expand(self.out_dim).clone()
+                noise_std[self.gripper_dim] = torch.tensor(
+                    self.gripper_noise_logvar_range[0],
+                    device=noise_std.device,
+                    dtype=noise_std.dtype,
+                )
         else:
             # use learnable noise level.
             noise_logvar = self.mlp_logvar(noise_feature)
@@ -91,11 +124,35 @@ class ExploreNoiseNet(nn.Module):
             torch.Tensor([B, Ta, Da])
         """
         noise_logvar = torch.tanh(noise_logvar)
-        noise_logvar = (
+        base_logvar = (
             self.logvar_min
             + (self.logvar_max - self.logvar_min) * (noise_logvar + 1) / 2.0
         )
-        noise_std = torch.exp(0.5 * noise_logvar)
+        if self.use_gripper_noise_range:
+            grip_min, grip_max = self.gripper_noise_logvar_range
+            grip_logvar_min = torch.log(
+                torch.tensor(
+                    grip_min**2,
+                    device=noise_logvar.device,
+                    dtype=noise_logvar.dtype,
+                )
+            )
+            grip_logvar_max = torch.log(
+                torch.tensor(
+                    grip_max**2,
+                    device=noise_logvar.device,
+                    dtype=noise_logvar.dtype,
+                )
+            )
+            gripper_logvar = (
+                grip_logvar_min
+                + (grip_logvar_max - grip_logvar_min)
+                * (noise_logvar[..., self.gripper_dim] + 1)
+                / 2.0
+            )
+            base_logvar = base_logvar.clone()
+            base_logvar[..., self.gripper_dim] = gripper_logvar
+        noise_std = torch.exp(0.5 * base_logvar)
         return noise_std
 
 

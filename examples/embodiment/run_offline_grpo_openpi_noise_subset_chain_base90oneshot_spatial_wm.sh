@@ -7,28 +7,28 @@ export SRC_FILE="${EMBODIED_PATH}/train_offline_grpo_openpi.py"
 
 source /opt/venv/openpi/bin/activate
 
-export PYTHONPATH=${REPO_PATH}:${PYTHONPATH:-}
-export TOKENIZERS_PARALLELISM=false
-export RLINF_TMPDIR="${RLINF_TMPDIR:-/mnt/project_rlinf/tmp/A100-2}"
-mkdir -p "${RLINF_TMPDIR}"
-export TMPDIR="${RLINF_TMPDIR}"
-export TMP="${RLINF_TMPDIR}"
-export TEMP="${RLINF_TMPDIR}"
-export TMUX_TMPDIR="${RLINF_TMPDIR}"
-export RAY_TMPDIR="${RLINF_TMPDIR}"
-unset RAY_ADDRESS
-# Ray defaults to /tmp/ray. Keep its session/socket files on project storage.
-ray stop --force >/dev/null 2>&1 || true
-rm -rf "${RAY_TMPDIR}/ray"
+CONFIG_NAME="libero_spatial_offline_grpo_openpi_pi05_noise_subset_base90_oneshot"
+CHAIN_NAME="libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset_chain_wm"
+FIRST_STAGE_MAX_EPOCHS="${FIRST_STAGE_MAX_EPOCHS:-12000}"
+LOG_ROOT="${LOG_ROOT:-${REPO_PATH}/logs/${CHAIN_NAME}-step2-cosinelr-subsetaware-base90_oneshot_new10_old5_wm}"
+CHAIN_LOG_FILE="${LOG_ROOT}/run_offline_grpo_openpi_noise_subset_chain_wm.log"
 
-CONFIG_NAME="libero_goal_offline_grpo_openpi_pi05_noise_subset_base90_oneshot"
-CHAIN_NAME="libero_goal_offline_grpo_openpi_pi05_flow_noise_subset_chain"
-FIRST_STAGE_MAX_EPOCHS="${FIRST_STAGE_MAX_EPOCHS:-8000}"
-LOG_ROOT="${LOG_ROOT:-${REPO_PATH}/logs_goal/${CHAIN_NAME}-step2-cosinelr-subsetaware-base90_oneshot_new10_old5}"
-CHAIN_LOG_FILE="${LOG_ROOT}/run_offline_grpo_openpi_noise_subset_chain.log"
+WM_REWARD_ENABLED="${WM_REWARD_ENABLED:-True}"
+WM_PACKAGE_PATH="${WM_PACKAGE_PATH:-/mnt/project_rlinf/jzn/workspace/continual_learning/wm_reward/libero_spatial_wm}"
+WM_CHECKPOINT_PATH="${WM_CHECKPOINT_PATH:-${WM_PACKAGE_PATH}/checkpoints/best.pt}"
+WM_EMBEDDING_CACHE="${WM_EMBEDDING_CACHE:-${WM_PACKAGE_PATH}/cache/libero_spatial_subset1}"
+WM_REWARD_COEF="${WM_REWARD_COEF:-0.2}"
+WM_REWARD_SCALE="${WM_REWARD_SCALE:-5.0}"
+WM_REWARD_BATCH_SIZE="${WM_REWARD_BATCH_SIZE:-64}"
+
+export PYTHONPATH=${REPO_PATH}:${PYTHONPATH:-}
+if [[ "${WM_REWARD_ENABLED}" == "True" || "${WM_REWARD_ENABLED}" == "true" || "${WM_REWARD_ENABLED}" == "1" ]]; then
+    export PYTHONPATH=${WM_PACKAGE_PATH}:${PYTHONPATH}
+fi
+export TOKENIZERS_PARALLELISM=false
 
 denoise_step="${DENOISE_STEP:-${denoise_step:-2}}"
-FULL_DATA_PATH="/mnt/project_rlinf/jzn/workspace/openpi/data/libero_goal_fullshot"
+FULL_DATA_PATH="/mnt/project_rlinf/jzn/workspace/openpi/data/libero_spatial_fullshot"
 NEW_TASK_TRAJ="${NEW_TASK_TRAJ:-${new_task_traj:-10}}"
 OLD_TASK_TRAJ="${OLD_TASK_TRAJ:-${old_task_traj:-5}}"
 CONTINUAL_REPLAY_SEED="${CONTINUAL_REPLAY_SEED:-${continual_replay_seed:-0}}"
@@ -39,7 +39,7 @@ ACTIVE_SUBSET_ID="${ACTIVE_SUBSET_ID:-1}"
 PREV_CKPT_PATH="${PREV_CKPT_PATH:-null}"
 SUBSET1_LR="${SUBSET1_LR:-${subset1_lr:-5.0e-6}}"
 SUBSET1_MIN_LR="${SUBSET1_MIN_LR:-${subset1_min_lr:-2.0e-6}}"
-SUBSETN_LR="${SUBSETN_LR:-${subsetn_lr:-1.5e-6}}"
+SUBSETN_LR="${SUBSETN_LR:-${subsetn_lr:-2.0e-6}}"
 SUBSETN_MIN_LR="${SUBSETN_MIN_LR:-${subsetn_min_lr:-1.0e-6}}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-${lr_warmup_steps:-500}}"
 
@@ -56,7 +56,7 @@ DATA_PATHS=(
 )
 
 EXPERIMENT_NAMES=(
-    "libero_goal_offline_grpo_openpi_pi05_flow_noise_subset${ACTIVE_SUBSET_ID}"
+    "libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset${ACTIVE_SUBSET_ID}_wm"
 )
 
 SUBSET_IDS=(
@@ -157,10 +157,19 @@ run_one_stage() {
         data.eval_batch_size="${EVAL_BATCH_SIZE}"
         runner.ckpt_path="${ckpt_path}"
         actor.model.num_steps="${denoise_step}"
+        actor.model.num_action_chunks=8
         actor.optim.lr_scheduler=cosine
         actor.optim.lr="${ACTOR_LR}"
         actor.optim.min_lr="${ACTOR_MIN_LR}"
         actor.optim.lr_warmup_steps="${LR_WARMUP_STEPS}"
+        algorithm.wm_reward.enabled="${WM_REWARD_ENABLED}"
+        algorithm.wm_reward.module_path="libero_wm_reward.reward:WorldModelReward"
+        algorithm.wm_reward.checkpoint_path="${WM_CHECKPOINT_PATH}"
+        algorithm.wm_reward.embedding_cache_path="${WM_EMBEDDING_CACHE}"
+        algorithm.wm_reward.coef="${WM_REWARD_COEF}"
+        algorithm.wm_reward.scale="${WM_REWARD_SCALE}"
+        algorithm.wm_reward.batch_size="${WM_REWARD_BATCH_SIZE}"
+        algorithm.wm_reward.keyframe_mode=chunk_contains_gripper_change
     )
 
     if [[ -n "${resume_dir}" ]]; then
@@ -183,6 +192,7 @@ log "Continual data root: ${FULL_DATA_PATH}"
 log "Continual selection: subset_id=${ACTIVE_SUBSET_ID}, new_task_traj=${NEW_TASK_TRAJ}, old_task_traj=${OLD_TASK_TRAJ}, replay_seed=${CONTINUAL_REPLAY_SEED}"
 log "LR schedule: cosine warmup_steps=${LR_WARMUP_STEPS}, lr=${ACTOR_LR}, min_lr=${ACTOR_MIN_LR}"
 log "Offline eval: if_offline_eval=${IF_OFFLINE_EVAL}, eval_step=${EVAL_STEP}, eval_batch_size=${EVAL_BATCH_SIZE}"
+log "WM reward: enabled=${WM_REWARD_ENABLED}, package=${WM_PACKAGE_PATH}, checkpoint=${WM_CHECKPOINT_PATH}, cache=${WM_EMBEDDING_CACHE}, coef=${WM_REWARD_COEF}, scale=${WM_REWARD_SCALE}"
 
 prev_ckpt_path="${PREV_CKPT_PATH}"
 for idx in "${!DATA_PATHS[@]}"; do
@@ -192,7 +202,15 @@ for idx in "${!DATA_PATHS[@]}"; do
     subset_id="${SUBSET_IDS[idx]}"
 
     if [[ "${stage_num}" -eq 1 ]]; then
-        run_one_stage             "${stage_num}"             "${experiment_name}"             "${data_path}"             "${subset_id}"             "${prev_ckpt_path}"             "$@"             runner.max_epochs="${FIRST_STAGE_MAX_EPOCHS}"             actor.optim.total_training_steps="${FIRST_STAGE_MAX_EPOCHS}"
+        run_one_stage \
+            "${stage_num}" \
+            "${experiment_name}" \
+            "${data_path}" \
+            "${subset_id}" \
+            "${prev_ckpt_path}" \
+            "$@" \
+            runner.max_epochs="${FIRST_STAGE_MAX_EPOCHS}" \
+            actor.optim.total_training_steps="${FIRST_STAGE_MAX_EPOCHS}"
     else
         run_one_stage "${stage_num}" "${experiment_name}" "${data_path}" "${subset_id}" "${prev_ckpt_path}" "$@"
     fi

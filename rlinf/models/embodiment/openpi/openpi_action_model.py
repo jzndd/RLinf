@@ -49,6 +49,8 @@ class OpenPi0Config(Pi0Config):
     noise_logvar_range: list = field(
         default_factory=lambda: [0.08, 0.16]
     )  # [min_std, max_std]
+    gripper_noise_logvar_range: list | None = None  # [min_std, max_std] for Libero gripper dim
+    reset_noise_param: bool = False  # reset flow-noise buffers after checkpoint load
     # hyper-parameters
     action_chunk: int = 5  # action chunk
     action_env_dim: int = 7  # for environment action dim
@@ -170,6 +172,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 activation_type="tanh",
                 noise_logvar_range=self.config.noise_logvar_range,
                 noise_scheduler_type="learn",
+                gripper_noise_logvar_range=self.config.gripper_noise_logvar_range,
+                gripper_dim=self.config.action_env_dim - 1,
             )
 
         # ===== DSRL components initialization =====

@@ -65,6 +65,15 @@ algorithm:
   eval_rollout_epoch: 0
   reward_type: chunk_level
   offline_reward_fn: l1
+  wm_reward:
+    enabled: False
+    module_path: libero_wm_reward.reward:WorldModelReward
+    checkpoint_path: null
+    embedding_cache_path: null
+    coef: 0.2
+    scale: 5.0
+    batch_size: 64
+    keyframe_mode: chunk_contains_gripper_change
   logprob_type: chunk_level
   entropy_type: token_level
   update_epoch: 1
@@ -113,7 +122,7 @@ actor:
   model:
     model_path: "/mnt/project_rlinf/jzn/workspace/openpi/checkpoints/sft/pi05_libero_90_oneshot/libero_90_oneshot/30000"
     num_steps: 4
-    num_action_chunks: 5
+    num_action_chunks: 8
     openpi:
       joint_logprob: True
       noise_method: "flow_noise"

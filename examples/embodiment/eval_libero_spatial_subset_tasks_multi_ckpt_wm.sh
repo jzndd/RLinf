@@ -9,7 +9,7 @@ EVAL_SCRIPT="${EMBODIED_PATH}/eval_libero_spatial_subset_tasks.sh"
 SUBSET_NAME="${1:-subset1}"
 CONFIG_NAME="${2:-libero_spatial_grpo_openpi_pi05_noise_base90_oneshot}"
 WORLD_SIZE="${3:-8}"
-BASE_LOG_DIR="${4:-${REPO_PATH}/logs/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset_chain-step2-cosinelr-subsetaware-base90_oneshot_new10_old5_reset_noise/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset1/eval_logs_l1}"
+BASE_LOG_DIR="${4:-${REPO_PATH}/logs/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset_chain_wm-step2-cosinelr-subsetaware-base90_oneshot_new10_old5_wm/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset1_wm/eval_logs_l1}"
 shift_count=$#
 if (( shift_count > 4 )); then
     shift_count=4
@@ -21,15 +21,16 @@ if [[ $# -gt 0 && "${1}" =~ ^[0-9]+$ ]]; then
     shift
 fi
 
-BASE_CKPTPATH="${REPO_PATH}/logs/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset_chain-step2-cosinelr-subsetaware-base90_oneshot_new10_old5_reset_noise/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset1/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset1/checkpoints"
+BASE_CKPTPATH="${REPO_PATH}/logs/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset_chain_wm-step2-cosinelr-subsetaware-base90_oneshot_new10_old5_wm/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset1_wm/libero_spatial_offline_grpo_openpi_pi05_flow_noise_subset1_wm/checkpoints"
 
 DEFAULT_CKPTS=(
-    "${BASE_CKPTPATH}/global_step_1000"
-    "${BASE_CKPTPATH}/global_step_1500"
-    "${BASE_CKPTPATH}/global_step_2000"
-    "${BASE_CKPTPATH}/global_step_2500"
-    "${BASE_CKPTPATH}/global_step_3000"
-    "${BASE_CKPTPATH}/global_step_3500"
+    "${BASE_CKPTPATH}/global_step_11500"
+    "${BASE_CKPTPATH}/global_step_11000"
+    "${BASE_CKPTPATH}/global_step_10500"
+    "${BASE_CKPTPATH}/global_step_10000"
+    "${BASE_CKPTPATH}/global_step_9500"
+    "${BASE_CKPTPATH}/global_step_9000"
+    "${BASE_CKPTPATH}/global_step_8500"
 )
 
 if [[ ! -f "${EVAL_SCRIPT}" ]]; then
